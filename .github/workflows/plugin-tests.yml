@@ -1,0 +1,24 @@
+name: ModelTrace Guard tests
+on:
+  push:
+    paths: ['codex-plugin/**', '.agents/plugins/marketplace.json', 'static/fingerprint-core.js', 'static/styles.css', 'data/unified_bank.json', '.github/workflows/plugin-tests.yml']
+  pull_request:
+    paths: ['codex-plugin/**', '.agents/plugins/marketplace.json', 'static/fingerprint-core.js', 'static/styles.css', 'data/unified_bank.json', '.github/workflows/plugin-tests.yml']
+permissions:
+  contents: read
+jobs:
+  plugin:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node codex-plugin/build-plugin.mjs
+      - run: node codex-plugin/validate-distribution.mjs
+      - run: node --test codex-plugin/modeltrace-guard/tests/*.test.mjs
+      - name: Ensure bundled assets match the current bank and scorer
+        run: git diff --exit-code -- codex-plugin/modeltrace-guard/assets codex-plugin/modeltrace-guard/scripts/fingerprint-core.mjs codex-plugin/modeltrace-guard/web/modeltrace.css

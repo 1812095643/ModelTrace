@@ -1,0 +1,18 @@
+{
+  "name": "modeltrace-guard",
+  "version": "0.1.0",
+  "description": "Codex model fingerprint monitoring with disposable forks of a frozen task snapshot.",
+  "author": {
+    "name": "xqy2006"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "ModelTrace Guard",
+    "shortDescription": "任务内探针 · 网页仪表盘 · 差异主动提醒",
+    "longDescription": "按工作工具调用次数，从原任务冻结快照分别 fork 进行检测与复测，测后清理临时分支，主任务只接收评分摘要。使用 ModelTrace 离线指纹库；首次不一致主动提醒，默认额外复测 3 次（可配置），全部不一致时要求停止任务并拦截后续工作工具。提供网页仪表盘、历史分页和桌面提醒。探针使用 Codex 已配置的账户与模型并消耗推理额度。",
+    "developerName": "xqy2006",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "为当前任务开启 ModelTrace Guard，使用随机间隔采样，并告诉我如何调整探测频率。"
+  }
+}

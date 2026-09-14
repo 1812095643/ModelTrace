@@ -1,0 +1,20 @@
+import assert from 'node:assert/strict';
+import { readFile, access } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+
+const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const marketplace = JSON.parse(await readFile(path.join(repository, '.agents/plugins/marketplace.json'), 'utf8'));
+assert.equal(marketplace.name, 'modeltrace');
+const entry = marketplace.plugins.find((plugin) => plugin.name === 'modeltrace-guard');
+assert.ok(entry); assert.equal(entry.source.source, 'local');
+assert.equal(entry.source.path, './codex-plugin/modeltrace-guard');
+assert.equal(entry.policy.installation, 'AVAILABLE'); assert.equal(entry.policy.authentication, 'ON_INSTALL');
+assert.ok(entry.category);
+const root = path.resolve(repository, entry.source.path);
+assert.ok(root.startsWith(repository + path.sep));
+const manifest = JSON.parse(await readFile(path.join(root, '.codex-plugin/plugin.json'), 'utf8'));
+assert.equal(manifest.name, entry.name); assert.equal(manifest.author.name, 'xqy2006');
+await access(path.join(root, manifest.skills, 'modeltrace-guard', 'SKILL.md'));
+assert.ok(JSON.parse(await readFile(path.join(root, 'hooks/hooks.json'), 'utf8')).hooks.PreToolUse);
+process.stdout.write(JSON.stringify({ valid: true, marketplace: marketplace.name, plugin: manifest.name, source: entry.source.path }) + '\n');

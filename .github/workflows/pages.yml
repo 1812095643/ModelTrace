@@ -28,7 +28,7 @@ jobs:
       - name: Assemble manual-only site
         run: |
           mkdir -p _site/data
-          cp static/index.html static/styles.css static/pages-app.js static/fingerprint-core.js static/challenge-browser.js static/.nojekyll _site/
+          cp static/index.html static/styles.css static/repository-link.css static/pages-app.js static/fingerprint-core.js static/challenge-browser.js static/.nojekyll _site/
           cp data/unified_bank.json _site/data/unified_bank.json
       - name: Upload static site
         uses: actions/upload-pages-artifact@v3

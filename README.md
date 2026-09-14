@@ -22,9 +22,17 @@ python start.py
 - **指纹库管理**：可以新建指纹库，或通过 API 为现有指纹库添加模型指纹。
 
 API Key 只用于当前页面发起请求，不写入磁盘。
-新执行的自动采集会在对应的 `*_reference.jsonl` 中保存实际 user prompt、base prompt、system prompt 和 user prefix；拟合后的 `*_bank.json` 与 `unified_bank.json` 只保存统计指纹和校准参数。
+自动采集会在对应的 `*_reference.jsonl` 中保存实际 user prompt、base prompt、system prompt 和 user prefix；拟合后的 `*_bank.json` 与 `unified_bank.json` 只保存统计指纹和校准参数。
 
 ## 指纹方法
+
+### Codex 任务内监测插件
+
+[ModelTrace Guard](codex-plugin/modeltrace-guard/README.md) 按工具调用次数，从原 Codex 任务的冻结快照分别 fork 进行普通检测和异常复测，测后清理临时分支，主任务只接收评分摘要。用户可调整工具间隔、复测次数（默认 3）、有效期和十种语言，不设每轮或任务累计探针上限。网页仪表盘提供完整历史分页和实时提醒；首次不一致要求智能体告知，额外复测全部不一致时停止原任务并拦截后续受支持的工作工具。探针由 Codex 自身生成并消耗对应推理额度，评分使用插件附带的 ModelTrace 指纹库，页面刷新不消耗模型额度。
+
+安装后在 Codex CLI 的 `/hooks` 中审阅并信任插件 hooks，再在目标任务中开启监测。安装、配置和结果解释详见[插件使用说明](codex-plugin/modeltrace-guard/README.md)。
+
+### 核心算法
 
 所有模型使用同一个全局特征空间、同一套特征与权重：
 

@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>ModelTrace Guard · 任务监测</title>
+  <link rel="icon" href="/mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/modeltrace.css">
+  <link rel="stylesheet" href="/dashboard.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar"><div class="product-name"><span class="product-mark">MT</span><strong>ModelTrace</strong><span class="version">Guard</span></div><div class="topbar-status"><span id="bank-badge">统一指纹库</span><span class="divider"></span><span id="connection" role="status" class="connection">正在连接本地服务…</span></div></header>
+  <div class="layout">
+  <aside class="sidebar">
+    <nav aria-label="监测工作区">
+      <a class="nav-button active" href="#overview"><span class="nav-icon">01</span><span><strong>任务监测</strong><small>概况与指纹差异</small></span></a>
+      <a class="nav-button" href="#history"><span class="nav-icon">02</span><span><strong>探针记录</strong><small>检查点与事件历史</small></span></a>
+      <a class="nav-button" href="#settings"><span class="nav-icon">03</span><span><strong>采样设置</strong><small>频率、复测与语言</small></span></a>
+    </nav>
+    <div class="sidebar-note"><strong>原任务快照 · 独立 fork</strong><span>Codex 生成探针，本地评分。</span><span>作者：xqy2006</span></div>
+  </aside>
+  <main id="overview" class="main-content"><div class="dashboard-workspace">
+    <section class="page-header"><div><h1>任务内监测</h1><p>观察检查点指纹，保留任务过程中的短暂差异。</p></div><div class="header-actions"><button id="refresh" class="button secondary" type="button">刷新记录</button></div></section>
+    <div id="error" class="notice danger" role="alert" hidden></div>
+    <div id="live-notice" class="notice danger" role="alert" hidden></div>
+    <div class="bank-source-note"><button id="enable-notifications" class="text-button" type="button">开启桌面提醒</button><span id="notification-status">网页内实时接收不一致提醒</span></div>
+    <section class="task-bar"><div class="task-control"><label for="session">监测任务</label><select id="session" aria-label="选择监测任务"><option value="">暂无监测任务</option></select></div><button id="rename-task" class="text-button" type="button" disabled>修改名称</button><span id="runtime" class="pill neutral">尚未开启</span></section>
+    <details id="task-identity" class="task-identity" hidden><summary>任务标识与开始时间</summary><p id="task-meta"></p></details>
+    <div class="bank-source-note bank-provenance"><span id="bank-source">参考库：ModelTrace 统一指纹库的插件打包快照</span><button id="bank-detail" class="text-button" type="button" disabled>查看指纹库来源</button></div>
+    <section class="metrics" aria-label="监测概况">
+      <article class="metric"><div class="metric-label">预期模型 <span>01</span></div><div id="expected" class="metric-value model-value">—</div><div id="expected-note" class="metric-note">等待任务模型信息</div></article>
+      <article class="metric"><div class="metric-label">已接受探针 <span>02</span></div><div class="metric-value"><span id="accepted">—</span><small id="issued"></small></div><div id="sample-note" class="metric-note">只计算实际提交的样本</div></article>
+      <article class="metric"><div class="metric-label">不一致记录 <span>03</span></div><div class="metric-value alert-value" id="mismatches">—</div><div id="alert-note" class="metric-note">强差异与弱候选分开记录</div></article>
+      <article class="metric"><div class="metric-label">采样缺口 <span>04</span></div><div class="metric-value" id="missed">—</div><div id="hook-note" class="metric-note">尚未观察到 hooks</div></article>
+    </section>
+    <section id="empty" class="panel empty" hidden><div class="empty-mark">⌁</div><h2>还没有任务监测记录</h2><p>在要监测的 Codex 任务里发送下面这句话。<br>打开此页面不会开启采样，也不会调用模型。</p><div class="start-prompt"><code>使用 $modeltrace-guard 为本任务开启监测</code><button id="copy-start" class="button secondary" type="button">复制提示词</button></div><small>首次使用请加载插件并在 Codex CLI 的 /hooks 中审阅信任。</small></section>
+    <div id="monitoring" hidden>
+      <p id="fork-note" class="bank-source-note"></p>
+      <section id="confirmation-panel" class="panel" hidden><div class="panel-heading"><div><h2>异常复测</h2></div><span id="confirmation-status" class="pill warning"></span></div><p id="confirmation-note" class="section-note" role="status"></p></section>
+      <section class="panel trace-panel"><div class="panel-heading"><div><h2>指纹轨迹</h2></div><div class="legend"><span><i class="dot compatible"></i>相符</span><span><i class="dot difference"></i>强差异</span><span><i class="dot uncertain"></i>不确定</span><span><i class="dot gap"></i>缺口</span></div></div><div id="trace" class="trace" aria-label="最近检查点轨迹"></div><div class="trace-footer"><span id="trace-range">等待第一个样本</span><span>每个点代表一次检查点 · 点击查看详情</span></div></section>
+      <div class="two-columns">
+        <section class="panel alerts-panel"><div class="panel-heading"><div><h2>智能体提醒</h2></div><span id="pending-alerts" class="pill neutral">无待告知</span></div><p class="section-note">检测到指纹不一致时，要求智能体主动告知用户。</p><div id="alerts" class="alert-list"></div></section>
+        <section class="panel latest-panel"><div class="panel-heading"><div><h2>最近一次指纹</h2></div><span id="latest-language" class="pill neutral">—</span></div><div id="latest"></div><p class="section-note weight-note">参考库内的相对权重</p><div id="weights" class="weights"></div></section>
+      </div>
+      <section id="history" class="panel history-panel"><div class="panel-heading"><div><h2>探针与事件记录</h2></div><label class="filter-label">筛选 <select id="filter"><option value="all">全部记录</option><option value="mismatch">候选不一致</option><option value="gap">采样缺口</option></select></label></div><div class="bank-source-note"><label>历史范围 <select id="history-kind"><option value="recent">最近记录</option><option value="samples">完整探针历史</option><option value="events">完整事件历史</option><option value="alerts">完整提醒历史</option></select></label><button id="history-more" class="text-button" type="button" disabled>更早一页</button></div><div class="table-scroll"><table><thead><tr><th>时间</th><th>结果 / 事件</th><th>采样时预期 → 指纹候选</th><th>语言</th><th>分段</th></tr></thead><tbody id="rows"></tbody></table></div><p id="history-note" class="table-note"></p></section>
+      <section id="settings" class="panel settings-panel"><div class="panel-heading"><div><h2>采样设置</h2></div><span id="settings-status" class="muted">修改后在原任务内生效</span></div><form id="config-form"><fieldset id="config-fields"><div class="settings-grid">
+        <div class="field"><span>工作工具间隔（次）</span><div class="range"><input name="toolMin" type="number" min="1" max="1000000" required aria-label="最少工具次数"><span>—</span><input name="toolMax" type="number" min="1" max="1000000" required aria-label="最多工具次数"></div></div>
+        <label class="field">异常复测次数<input name="retryCount" type="number" min="1" max="100" required></label>
+        <label class="field">单个探针有效期（秒）<input name="pendingSeconds" type="number" min="1" max="1000000" required aria-describedby="expiry-note"></label>
+      </div><p id="expiry-note" class="section-note">从发出探针开始计算提交时限，默认 180 秒；超时只记为采样缺口，不计为模型不一致。这不是采样间隔，修改后用于新发出的探针。</p><div class="language-field"><span class="field-title">探针语言池 <small>单选固定语言，多选随机抽取</small></span><div id="languages" class="languages"></div></div></fieldset><p class="section-note">按工作工具调用次数触发，上下限相等即固定间隔，不设每轮或任务累计数量上限。首次不一致立即提醒，再连续复测（默认 3 次，不含首次）；全部仍不一致则要求智能体停止原任务并告知用户。当前复测组沿用开始时的次数与语言，更新不清空历史。</p><div class="form-footer"><span id="save-message" role="status"></span><div><button id="stop" class="button quiet-danger" type="button">停止本任务监测</button><button id="save" class="button primary" type="submit">保存采样设置</button></div></div></form></section>
+    </div>
+    <footer class="footer"><span>ModelTrace Guard <span class="slash">/</span> xqy2006</span><span>本机读取 · 每 3 秒刷新 · 刷新不消耗模型额度</span></footer>
+  </div></main></div>
+  <dialog id="detail"><div class="dialog-head"><h2 id="detail-title">检查点详情</h2><button id="close-detail" class="button secondary" type="button">关闭</button></div><pre id="detail-body"></pre><p class="section-note">这里只展示元数据和评分，不通过网页接口提供探针数字数组或会话正文。</p></dialog>
+  <dialog id="stop-dialog"><h2>停止当前选中的任务监测？</h2><p>不再生成新探针。已有指纹、差异提醒与历史记录都会保留；网页服务继续运行。</p><div class="dialog-actions"><button id="cancel-stop" class="button secondary" type="button">继续监测</button><button id="confirm-stop" class="button quiet-danger" type="button">确认停止</button></div></dialog>
+  <dialog id="name-dialog"><h2>修改监测任务的显示名称</h2><form id="name-form"><label for="task-name">任务名称<input id="task-name" maxlength="120" required placeholder="例如：重构登录流程"></label><p id="name-message" role="status"></p><div class="dialog-actions"><button id="cancel-name" class="button secondary" type="button">取消</button><button id="save-name" class="button primary" type="submit">保存名称</button></div></form></dialog>
+</body>
+</html>

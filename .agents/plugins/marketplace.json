@@ -1,0 +1,20 @@
+{
+  "name": "modeltrace",
+  "interface": {
+    "displayName": "Modeltrace"
+  },
+  "plugins": [
+    {
+      "name": "modeltrace-guard",
+      "source": {
+        "source": "local",
+        "path": "./codex-plugin/modeltrace-guard"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
