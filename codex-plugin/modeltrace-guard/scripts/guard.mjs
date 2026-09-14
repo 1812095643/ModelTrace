@@ -10,7 +10,7 @@ export { summarize } from './status.mjs';
 import {
   DEFAULTS, WARNING, abandon, classifySample, dataDirectory, digest, expirePending, issue,
   readState, recentComparable, record, schedule, segment, setTaskName, setTurn, validateConfig, validateNumbers, withState, workspaceName,
-  interruptConfirmation, updateConfirmation, processAlive,
+  interruptConfirmation, updateConfirmation, processAlive, BACKGROUND_STATE_LOCK,
 } from './state.mjs';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -81,7 +81,36 @@ export function isControlCommand(event) {
   try { parseArguments(tokens.slice(2)); return true; } catch { return false; }
 }
 
-export async function handleHook(event, directory, now = Date.now(), draw = randomInt) {
+function preToolDecision(event, state, directory) {
+  const reason = state ? notificationContext(state, directory) || controlContext(state, directory) : null;
+  if (reason && !isControlCommand(event)) return { systemMessage: reason, hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } };
+  return {};
+}
+
+async function busyHookFallback(event, directory, error) {
+  if (error.code !== 'MODELTRACE_STATE_BUSY' || !['PreToolUse', 'Stop'].includes(event.hook_event_name)) throw error;
+  let state;
+  try { state = await readState(directory, event.session_id); }
+  catch {
+    const reason = 'ModelTrace Guard: task state is unavailable; pause work and tell the user. Retry the state check before continuing. This is a monitoring error, not a model mismatch.';
+    if (event.hook_event_name === 'PreToolUse' && !isControlCommand(event)) return { systemMessage: reason, hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } };
+    return { systemMessage: reason };
+  }
+  // State commits use atomic rename, so readers can enforce the last committed
+  // policy without taking or stealing the busy writer's lease. Do not change
+  // counts, acknowledge alerts or clear a halt on this read-only path.
+  if (event.hook_event_name === 'PreToolUse') return preToolDecision(event, state, directory);
+  if (!state) return {};
+  const waiting = pendingAlerts(state), control = controlContext(state, directory);
+  if (!state.enabled && !waiting.length) return state.taskHalt ? { systemMessage: control } : {};
+  const notice = [waiting.map(userNotice).join('\n'), control].filter(Boolean).join('\n');
+  if (!notice) return {};
+  const continueOnce = !event.stop_hook_active && state.stopTurn !== (state.turn || 'no-turn')
+    && (waiting.length || state.confirmation?.status === 'active');
+  return { systemMessage: notice, ...(continueOnce ? { decision: 'block', reason: notificationContext(state, directory) || control } : {}) };
+}
+
+export async function handleHook(event, directory, now = Date.now(), draw = randomInt, { background = false } = {}) {
   if (!event || typeof event.session_id !== 'string' || !event.session_id || event.session_id.length > 256) throw new Error('Missing or invalid session_id in hook input');
   // No subagent samples may be submitted as root-task evidence.
   if (event.agent_id || event.parent_session_id) return {};
@@ -90,6 +119,7 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
   return withState(directory, event.session_id, async (state) => {
     const hook = event.hook_event_name;
     state.lastHookAt = now;
+    if (background) state.lastBackgroundHookAt = now;
     state.hooksSeen += 1;
     const currentTurn = setTurn(state, event.turn_id);
     if (currentTurn && ['SessionStart', 'UserPromptSubmit'].includes(hook)) { state.runtimePaused = false; state.runtimeEndedAt = null; }
@@ -123,11 +153,7 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
     }
     const turnKey = state.turn || 'no-turn';
     const waiting = pendingAlerts(state);
-    if (hook === 'PreToolUse') {
-      const reason = waiting.length ? notificationContext(state, directory) : controlContext(state, directory);
-      if (reason && !isControlCommand(event)) return { systemMessage: reason, hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } };
-      return {};
-    }
+    if (hook === 'PreToolUse') return preToolDecision(event, state, directory);
     const deliver = (output, force = false) => {
       if (!['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'Stop'].includes(hook)) return output;
       if (state.taskHalt) {
@@ -200,7 +226,7 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
     if (expired) return deliver({ systemMessage: 'ModelTrace Guard: a background checkpoint expired. Coverage gap recorded; work may continue.' });
     issue(state, now, draw);
     return deliver({}, hook === 'SessionStart');
-  });
+  }, background ? BACKGROUND_STATE_LOCK : undefined).catch((error) => busyHookFallback(event, directory, error));
 }
 
 function parseArguments(args) {
@@ -231,9 +257,9 @@ async function stdinJson() {
 }
 
 const forkSubmission = Symbol('internal fork submission');
-export async function submitForkResult(directory, session, challenge, numbers, fork) {
+export async function submitForkResult(directory, session, challenge, numbers, fork, stateOptions) {
   if (!fork?.snapshot?.sha256 || fork.mode !== 'ephemeral_fork' || fork.cleanedUp !== true) throw new Error('A completed and cleaned-up fork receipt is required');
-  return run(['submit', '--session', session, '--data-dir', directory, '--challenge', challenge, '--numbers', numbers], {}, { key: forkSubmission, fork });
+  return run(['submit', '--session', session, '--data-dir', directory, '--challenge', challenge, '--numbers', numbers], {}, { key: forkSubmission, fork, stateOptions });
 }
 
 export async function run(args, env = process.env, receipt = null) {
@@ -303,6 +329,9 @@ export async function run(args, env = process.env, receipt = null) {
     if (receipt?.key !== forkSubmission) throw new Error('In-context --numbers submissions are disabled. Use probe --challenge; numbers must stay in a disposable Codex fork.');
     const { bank, metadata, analyzeGlobalOutputs } = await loadArtifacts();
     return withState(directory, session, (state) => {
+      // A background submission can wait behind a slow writer. Check expiry
+      // at lock acquisition, not against the time before that wait began.
+      const now = Date.now();
       const p = state.pending;
       if (!state.enabled || !p || p.id !== options.challenge || p.epoch !== state.epoch) throw new Error('No matching live checkpoint in this task (duplicate, stale or wrong-session submission)');
       if (state.bankSha256 && state.bankSha256 !== metadata.bankSha256) {
@@ -341,7 +370,7 @@ export async function run(args, env = process.env, receipt = null) {
       if (state.confirmation?.status === 'active') issue(state, now);
       const { numbers: omitted, ...publicSample } = sample;
       return { accepted: true, sample: publicSample, warning: WARNING, userNotice: alert ? userNotice(alert) : null, agentAction: state.taskHalt ? 'stop_and_notify_user' : alert ? 'notify_user_now' : state.confirmation?.status === 'active' ? 'complete_retries' : null, notification: alert, notificationContext: alert ? notificationContext(state, directory, [alert]) : null, confirmation: state.confirmation || null, taskHalt: state.taskHalt || null, controlContext: controlContext(state, directory), challengeContext: state.pending?.confirmationId ? challengeContext(state, directory) : null };
-    });
+    }, receipt.stateOptions);
   }
   const patch = {};
   for (const key of fields) if (options[key] !== undefined) patch[key.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = key === 'mode' ? options[key] : key === 'languages' ? options[key].split(',').map((code) => code.trim().toLowerCase()) : Number(options[key]);

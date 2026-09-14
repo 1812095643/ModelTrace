@@ -253,27 +253,70 @@ export async function readState(directory, session) {
   } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
 }
 
-export async function withState(directory, session, callback) {
+export const STATE_LOCK_TIMEOUT_MS = 1200;
+// Background hook processes may queue behind a burst of fsynced state writes.
+// This wait budget never changes how long a foreground hook waits for the lock.
+export const BACKGROUND_STATE_LOCK = Object.freeze({ lockTimeoutMs: 10000 });
+
+const windowsFileBusy = (error, platform) => platform === 'win32' && ['EPERM', 'EACCES', 'EBUSY'].includes(error.code);
+
+export async function attemptStateLock(lockname, { platform = process.platform, openFile = open } = {}) {
+  try { return { lock: await openFile(lockname, 'wx', 0o600) }; }
+  catch (error) {
+    // A just-unlinked Windows lease can be delete-pending rather than absent;
+    // exclusive open then returns EPERM/EACCES, not necessarily EEXIST.
+    if (error.code === 'EEXIST' || windowsFileBusy(error, platform)) return { error };
+    throw error;
+  }
+}
+
+export async function replaceStateFile(temporary, filename, { timeoutMs = 1000, platform = process.platform, replace = rename } = {}) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0 || timeoutMs > 1000) throw new Error('replacement timeoutMs must be a number in 0..1000');
+  const deadline = performance.now() + timeoutMs;
+  for (;;) {
+    try { await replace(temporary, filename); return; }
+    catch (error) {
+      if (!windowsFileBusy(error, platform)) throw error;
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) {
+        const busy = new Error(`State busy; retry. Atomic state replacement remained unavailable: ${filename}`, { cause: error });
+        busy.code = 'MODELTRACE_STATE_BUSY'; busy.operation = 'commit';
+        throw busy;
+      }
+      // Windows readers/scanners can briefly prevent replacement. Keep both
+      // files intact and retain our writer lease; never unlink the old state.
+      await delay(Math.min(remaining, randomInt(10, 31)));
+    }
+  }
+}
+
+export async function withState(directory, session, callback, { lockTimeoutMs = STATE_LOCK_TIMEOUT_MS } = {}) {
+  if (!Number.isSafeInteger(lockTimeoutMs) || lockTimeoutMs < 0 || lockTimeoutMs > 60000) throw new Error('lockTimeoutMs must be an integer in 0..60000');
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const filename = sessionPath(directory, session);
   const lockname = `${filename}.lock`;
   let lock;
-  const deadline = Date.now() + 1200;
+  const deadline = performance.now() + lockTimeoutMs;
   while (!lock) {
-    try {
-      lock = await open(lockname, 'wx', 0o600);
-      await lock.writeFile(JSON.stringify({ pid: process.pid, nonce: randomUUID(), at: Date.now() }));
-      await lock.sync();
+    const attempt = await attemptStateLock(lockname);
+    lock = attempt.lock;
+    if (lock) break;
+    if (attempt.error.code === 'EEXIST' && await reapDeadLock(lockname)) continue;
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) {
+      const busy = new Error(`State busy; retry. Timed out after ${lockTimeoutMs}ms waiting for task state: ${lockname}`, { cause: attempt.error });
+      busy.code = 'MODELTRACE_STATE_BUSY'; busy.lockTimeoutMs = lockTimeoutMs;
+      throw busy;
     }
-    catch (error) {
-      if (error.code !== 'EEXIST') throw error;
-      if (await reapDeadLock(lockname)) continue;
-      if (Date.now() > deadline) throw new Error(`State busy; retry. If no guard command is running, remove stale lock: ${lockname}`);
-      await delay(30);
-    }
+    // Avoid synchronized contenders repeatedly waking on the same 30ms tick.
+    await delay(Math.min(remaining, randomInt(20, 51)));
   }
   const temporary = `${filename}.${process.pid}.${randomUUID()}.tmp`;
   try {
+    // Initialization is covered by cleanup too; a failed write/fsync must not
+    // leave an empty lease owned by this still-running process.
+    await lock.writeFile(JSON.stringify({ pid: process.pid, nonce: randomUUID(), at: Date.now() }));
+    await lock.sync();
     const state = await readState(directory, session) || newState(session);
     if (state.samplingMode !== 'fork') {
       abandon(state, Date.now(), 'migrated_to_fork');
@@ -300,12 +343,16 @@ export async function withState(directory, session, callback) {
     const file = await open(temporary, 'wx', 0o600);
     try { await file.writeFile(JSON.stringify(state, null, 2) + '\n'); await file.sync(); }
     finally { await file.close(); }
-    await rename(temporary, filename);
+    // Replacement retries consume only the remaining wait budget (and at
+    // most one second), including on the synchronous foreground path.
+    await replaceStateFile(temporary, filename, { timeoutMs: Math.max(0, Math.min(1000, deadline - performance.now())) });
     return result;
   } finally {
-    await unlink(temporary).catch((error) => { if (error.code !== 'ENOENT') throw error; });
-    await lock.close();
-    await unlink(lockname);
+    try { await unlink(temporary).catch((error) => { if (error.code !== 'ENOENT') throw error; }); }
+    finally {
+      try { await lock.close(); }
+      finally { await unlink(lockname); }
+    }
   }
 }
 

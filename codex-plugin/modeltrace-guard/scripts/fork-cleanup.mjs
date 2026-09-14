@@ -6,17 +6,32 @@ import { openAppServer } from './app-server-client.mjs';
 import { cleanupPath, lastTurn } from './fork-snapshot.mjs';
 import { processAlive, readState, reapDeadLock, record, withState } from './state.mjs';
 
+// An omitted source filter only lists interactive tasks. Deletion cascades to
+// spawned descendants of every source, including those already archived.
+export const CLEANUP_SOURCE_KINDS = Object.freeze([
+  'cli', 'vscode', 'exec', 'appServer', 'subAgent', 'subAgentReview',
+  'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther', 'unknown',
+]);
+
 export async function cleanSnapshot(client, job) {
   const snapshot = job.snapshot;
   if (job.purpose !== 'modeltrace-temporary-base' || !snapshot?.sourceSession || snapshot.id === snapshot.sourceSession) throw new Error('Invalid temporary fork ownership');
   let thread;
-  try { ({ thread } = await client.request('thread/read', { threadId: snapshot.id })); }
+  try { ({ thread } = await client.request('thread/read', { threadId: snapshot.id, includeTurns: false })); }
   catch (error) { if (/no rollout found|thread not found|not found for thread/i.test(error.message)) return { status: 'deleted', alreadyAbsent: true }; throw error; }
   if (thread.id !== snapshot.id || thread.forkedFromId !== snapshot.sourceSession || thread.ephemeral || thread.path !== snapshot.path) throw new Error('Temporary fork ownership changed; nothing deleted');
   const turn = await lastTurn(client, snapshot.id);
   if (!snapshot.sourceTurn || turn?.id !== snapshot.sourceTurn || turn.status === 'inProgress') throw new Error('Temporary base was used or its boundary is unknown; preserving it for user review');
-  const descendants = await client.request('thread/list', { ancestorThreadId: snapshot.id, limit: 1 });
-  if (descendants.data?.length) throw new Error('Temporary base has persisted descendants; preserving them for user review');
+  for (const archived of [false, true]) {
+    const descendants = await client.request('thread/list', {
+      ancestorThreadId: snapshot.id, limit: 1, archived,
+      sourceKinds: [...CLEANUP_SOURCE_KINDS], modelProviders: [], useStateDbOnly: true,
+    });
+    if (!Array.isArray(descendants?.data)) throw new Error('Cannot verify temporary base descendants; nothing deleted');
+    if (descendants.data.length || descendants.nextCursor) throw new Error('Temporary base has persisted descendants; preserving them for user review');
+  }
+  const latest = await lastTurn(client, snapshot.id);
+  if (latest?.id !== snapshot.sourceTurn || latest.status === 'inProgress') throw new Error('Temporary base changed during cleanup checks; nothing deleted');
   await client.request('thread/delete', { threadId: snapshot.id }, 45000);
   return { status: 'deleted', deletedAt: Date.now() };
 }

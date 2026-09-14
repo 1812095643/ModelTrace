@@ -4,12 +4,13 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { ROOT, run, handleHook, loadArtifacts, submitForkResult, summarize } from '../scripts/guard.mjs';
 import { readState, withState, processAlive } from '../scripts/state.mjs';
 import { runForkProbe, forkParameters, verifyFork, generateProbe, requireTrustedGuard } from '../scripts/fork-runner.mjs';
 import { BACKGROUND_EVENTS, BACKGROUND_TIMEOUT_SECONDS, handleBackgroundHook, waitForConfirmation } from '../scripts/background.mjs';
-import { cleanSnapshot, cleanupPending } from '../scripts/fork-cleanup.mjs';
-import { cleanupPath } from '../scripts/fork-snapshot.mjs';
+import { cleanSnapshot, cleanupPending, CLEANUP_SOURCE_KINDS } from '../scripts/fork-cleanup.mjs';
+import { cleanupPath, freezeSnapshot, snapshotBoundaries, sourceSettings } from '../scripts/fork-snapshot.mjs';
 
 // In-memory protocol double. No Codex process, provider, API or real task is
 // contacted; synthetic arrays test workflow invariants, never identification.
@@ -22,9 +23,9 @@ async function fixture(t) {
   const prediction = analyzeGlobalOutputs([{ text: integers, expected_count: 300 }], bank).results[0].model;
   const model = bank.models.find((m) => m.id !== prediction).id;
   const source = path.join(directory, 'source.jsonl');
-  await writeFile(source, JSON.stringify({ type: 'session_meta', payload: { id: session, model_provider: 'fixture', cwd: directory } }) + '\n' + JSON.stringify({ type: 'turn_context', payload: { model, effort: 'high', cwd: directory } }) + '\n');
+  // Deliberately do not create a rollout file: all setup must use task metadata.
   const initialHistory = [{ id: 'frozen-turn', status: 'interrupted', items: [{ type: 'userMessage', text: 'Original task context, no probe answers' }] }];
-  const threads = new Map([[session, { id: session, path: source, history: structuredClone(initialHistory) }]]), calls = [], generatedHistories = [];
+  const threads = new Map([[session, { id: session, path: source, model, modelProvider: 'fixture', reasoningEffort: 'high', cwd: directory, history: structuredClone(initialHistory) }]]), calls = [], generatedHistories = [];
   let createdBase = 0, closed = 0;
   function connect() {
     const ephemeral = [];
@@ -36,9 +37,10 @@ async function fixture(t) {
         if (method === 'thread/turns/list') { const thread = threads.get(params.threadId); return { data: structuredClone(thread.history), nextCursor: null }; }
         if (method === 'thread/fork') {
           const parent = threads.get(params.threadId); assert.ok(parent);
-          const id = randomUUID(), thread = { id, path: params.ephemeral ? null : `${source}.${id}`, ephemeral: Boolean(params.ephemeral), forkedFromId: parent.id, history: structuredClone(parent.history) };
+          if (params.ephemeral && params.deferGoalContinuation) throw new Error('deferGoalContinuation cannot be combined with ephemeral');
+          const id = randomUUID(), thread = { id, path: params.ephemeral ? null : `${source}.${id}`, cwd: params.cwd, ephemeral: Boolean(params.ephemeral), forkedFromId: parent.id, goal: structuredClone(parent.goal || null), history: structuredClone(parent.history) };
           threads.set(id, thread); if (params.ephemeral) ephemeral.push(id); else createdBase++;
-          return { thread, model, modelProvider: 'fixture', reasoningEffort: 'high', serviceTier: 'default', instructionSources: [] };
+          return { thread, model, modelProvider: 'fixture', reasoningEffort: 'high', cwd: params.cwd, serviceTier: 'default', instructionSources: [] };
         }
         if (method === 'thread/list') return { data: [] };
         if (method === 'thread/delete') { assert.notEqual(params.threadId, session); threads.delete(params.threadId); return {}; }
@@ -95,6 +97,173 @@ test('normal matching probes also use disposable forks and queue base deletion',
   assert.equal(JSON.parse(await readFile(cleanupPath(f.directory, result.sample.fork.snapshot.id), 'utf8')).status, 'pending');
 });
 
+test('source settings use one metadata-only request without opening a rollout or reading default config', async (t) => {
+  const f = await fixture(t), source = f.threads.get(f.session);
+  await assert.rejects(readFile(source.path), { code: 'ENOENT' });
+  const client = { request: async (method, params) => {
+    assert.equal(method, 'thread/read');
+    assert.deepEqual(params, { threadId: f.session, includeTurns: false });
+    return { thread: { ...source, get turns() { throw new Error('Do not inspect history'); } } };
+  } };
+  assert.deepEqual(await sourceSettings(client, f.session), { model: f.model, provider: 'fixture', effort: 'high', cwd: f.directory });
+  source.model = 'changed-source-model'; source.reasoningEffort = 'max';
+  assert.deepEqual(await sourceSettings(client, f.session), { model: 'changed-source-model', provider: 'fixture', effort: 'max', cwd: f.directory });
+});
+
+test('unavailable task settings fail before creating a fork, without history or default-config fallback', async (t) => {
+  const f = await fixture(t), original = f.threads.get(f.session);
+  const patches = [
+    { id: randomUUID() }, { ephemeral: true }, { path: null }, { path: 'relative.jsonl' },
+    { model: null }, { model: ' ' }, { modelProvider: null }, { modelProvider: 42 },
+    { reasoningEffort: undefined }, { reasoningEffort: {} }, { cwd: null }, { cwd: 'relative-workspace' },
+  ];
+  for (const patch of patches) {
+    f.threads.set(f.session, { ...original, ...patch });
+    f.calls.length = 0;
+    await assert.rejects(() => freezeSnapshot(f.connect(), f.session, f.directory), /metadata|persisted Codex history/);
+    assert.deepEqual(f.calls.map(({ method }) => method), ['thread/read']);
+    assert.equal(f.counts().createdBase, 0);
+  }
+  const withoutEffort = { ...original }; delete withoutEffort.reasoningEffort;
+  f.threads.set(f.session, withoutEffort);
+  await assert.rejects(() => sourceSettings(f.connect(), f.session), /metadata lacks/);
+});
+
+test('an explicitly unset reasoning effort stays unset, without reading a default', async (t) => {
+  const f = await fixture(t);
+  f.threads.get(f.session).reasoningEffort = null;
+  const snapshot = await freezeSnapshot(f.connect(), f.session, f.directory);
+  assert.equal(snapshot.effort, null);
+  const fork = f.calls.find(({ method }) => method === 'thread/fork');
+  assert.equal(fork.params.config, undefined);
+});
+
+test('snapshot verification requests only turn metadata and preserves the native compacted context', async (t) => {
+  const f = await fixture(t);
+  const compactedContext = [{ type: 'contextCompaction', summary: 'Native compacted task context' }];
+  f.threads.get(f.session).history[0].items = structuredClone(compactedContext);
+  const connect = () => {
+    const client = f.connect(), request = client.request;
+    client.request = async (method, params) => {
+      if (method === 'thread/turns/list') assert.equal(params.itemsView, 'notLoaded', 'Never export full transcript bodies for a snapshot digest');
+      if (method === 'thread/read') assert.equal(params.includeTurns, false);
+      return request(method, params);
+    };
+    return client;
+  };
+  const pending = (await f.command('start')).pending;
+  const result = await runForkProbe(f.directory, f.session, pending.id, {}, { ...f.dependencies, connect });
+  assert.equal(result.accepted, true, result.reason);
+  assert.equal(result.sample.fork.snapshot.sha256Scope, 'turn_boundaries_v1');
+  assert.equal(result.sample.fork.snapshot.turnCount, 1);
+  assert.deepEqual(f.generatedHistories[0][0].items, compactedContext);
+  assert.deepEqual(f.threads.get(f.session).history[0].items, compactedContext);
+  for (const call of f.calls.filter((c) => c.method === 'thread/fork')) {
+    assert.equal(call.params.excludeTurns, true);
+    assert.equal(call.params.deferGoalContinuation, call.params.ephemeral ? undefined : true);
+    assert.equal(call.params.cwd, f.directory);
+    assert.equal(call.params.history, undefined);
+    assert.equal(call.params.path, undefined);
+  }
+});
+
+test('fork preparation preserves task goals and messages and uses runtime-compatible parameters', async (t) => {
+  const f = await fixture(t), goal = { objective: 'Continue original work', status: 'active', tokenBudget: 1000 };
+  f.threads.get(f.session).goal = structuredClone(goal);
+  const pending = (await f.command('start')).pending;
+  const result = await runForkProbe(f.directory, f.session, pending.id, {}, { ...f.dependencies,
+    generate: async (client, id, ...rest) => {
+      const parent = f.threads.get(f.threads.get(id).forkedFromId);
+      assert.deepEqual(parent.goal, goal);
+      return f.dependencies.generate(client, id, ...rest);
+    },
+  });
+  assert.equal(result.accepted, true, result.reason);
+  assert.deepEqual(f.threads.get(f.session).goal, goal);
+  assert.deepEqual(f.threads.get(f.session).history, f.initialHistory);
+  assert.ok(!f.calls.some(({ method }) => method.startsWith('thread/goal/')));
+  for (const call of f.calls.filter(({ method }) => method === 'thread/fork')) assert.equal(call.params.deferGoalContinuation, call.params.ephemeral ? undefined : true);
+});
+
+test('workspace drift or incorrect fork ownership prevents inference', async (t) => {
+  for (const variant of ['response-cwd', 'thread-cwd', 'wrong-parent', 'source-id', 'base-id']) {
+    const f = await fixture(t), pending = (await f.command('start')).pending;
+    const connect = () => {
+      const client = f.connect(), request = client.request;
+      client.request = async (method, params) => {
+        const response = await request(method, params);
+        if (method === 'thread/fork' && params.ephemeral) {
+          if (variant === 'response-cwd') response.cwd = path.join(f.directory, 'wrong');
+          if (variant === 'thread-cwd') response.thread.cwd = path.join(f.directory, 'wrong');
+          if (variant === 'wrong-parent') response.thread.forkedFromId = 'other-task';
+          if (variant === 'source-id') response.thread.id = f.session;
+          if (variant === 'base-id') response.thread.id = params.threadId;
+        }
+        return response;
+      };
+      return client;
+    };
+    const result = await runForkProbe(f.directory, f.session, pending.id, {}, { ...f.dependencies, connect });
+    assert.equal(result.accepted, false);
+    assert.match(result.reason, /workspace|disposable/);
+    assert.equal(f.generatedHistories.length, 0);
+    assert.equal((await readState(f.directory, f.session)).samples.length, 0);
+  }
+});
+
+test('snapshot deletion boundary is durable before another metadata request can fail', async (t) => {
+  const f = await fixture(t), client = f.connect(), request = client.request;
+  let base;
+  client.request = async (method, params) => {
+    if (method === 'thread/turns/list' && params.sortDirection === 'asc') {
+      base = params.threadId;
+      const saved = JSON.parse(await readFile(cleanupPath(f.directory, base), 'utf8'));
+      assert.equal(saved.status, 'active');
+      assert.equal(saved.snapshot.sourceTurn, 'frozen-turn');
+      throw new Error('Synthetic transport failure after boundary capture');
+    }
+    return request(method, params);
+  };
+  await assert.rejects(() => freezeSnapshot(client, f.session, f.directory), /Synthetic transport failure/);
+  const job = JSON.parse(await readFile(cleanupPath(f.directory, base), 'utf8'));
+  assert.equal(job.status, 'pending');
+  assert.equal(job.snapshot.sourceTurn, 'frozen-turn');
+  assert.equal((await cleanSnapshot(f.connect(), job)).status, 'deleted');
+  assert.equal(f.threads.has(base), false);
+  assert.equal(f.threads.has(f.session), true);
+});
+
+test('snapshot metadata pagination hashes boundaries without accessing turn bodies', async () => {
+  let reads = 0;
+  const client = { request: async (method, params) => {
+    assert.equal(method, 'thread/turns/list');
+    assert.equal(params.itemsView, 'notLoaded');
+    assert.equal(params.sortDirection, 'asc');
+    assert.equal(params.cursor, reads ? 'next-page' : undefined);
+    const turn = { id: reads ? 't2' : 't1', status: 'completed', get items() { throw new Error('Do not materialize transcript bodies'); } };
+    reads++;
+    return { data: [turn], nextCursor: reads === 1 ? 'next-page' : null };
+  } };
+  const first = await snapshotBoundaries(client, 'base', 't2');
+  assert.equal(reads, 2); assert.equal(first.turnCount, 2);
+  assert.equal(first.sha256Scope, 'turn_boundaries_v1');
+  assert.match(first.sha256, /^[a-f0-9]{64}$/);
+  reads = 0;
+  assert.deepEqual(await snapshotBoundaries(client, 'base', 't2'), first);
+});
+
+test('snapshot metadata rejects stuck pagination and changed or unfinished boundaries', async () => {
+  for (const variant of ['cursor', 'empty', 'changed', 'unfinished']) {
+    let reads = 0;
+    const client = { request: async () => {
+      reads++;
+      return { data: variant === 'empty' ? [] : [{ id: 't', status: variant === 'unfinished' ? 'inProgress' : 'completed' }], nextCursor: ['cursor', 'empty'].includes(variant) ? 'same' : null };
+    } };
+    await assert.rejects(() => snapshotBoundaries(client, 'base', variant === 'changed' ? 'different' : 't'), /pagination|boundary/);
+    assert.ok(reads <= 2);
+  }
+});
+
 test('untrusted guard or malformed fork output becomes a gap, never a main-context fallback', async (t) => {
   for (const fail of ['trust', 'format']) {
     const f = await fixture(t), pending = (await f.command('start')).pending;
@@ -114,9 +283,10 @@ test('the public CLI rejects manual numeric submissions', async (t) => {
 
 test('cleanup refuses source task, changed base, and bases with new descendants', async () => {
   const job = { purpose: 'modeltrace-temporary-base', snapshot: { id: 'base', sourceSession: 'source', path: '/base', sourceTurn: 't' } };
-  for (const variant of ['source', 'changed', 'descendants']) {
+  for (const variant of ['source', 'changed', 'descendants', 'unknown-boundary']) {
     const calls = [], current = structuredClone(job);
     if (variant === 'source') current.snapshot.id = 'source';
+    if (variant === 'unknown-boundary') delete current.snapshot.sourceTurn;
     const client = { request: async (method) => {
       calls.push(method);
       if (method === 'thread/read') return { thread: { id: 'base', forkedFromId: 'source', path: '/base' } };
@@ -126,6 +296,44 @@ test('cleanup refuses source task, changed base, and bases with new descendants'
     } };
     await assert.rejects(() => cleanSnapshot(client, current));
     assert.ok(!calls.includes('thread/delete'));
+  }
+});
+
+test('cleanup includes archived and non-interactive descendants without scanning rollout files', async () => {
+  const job = { purpose: 'modeltrace-temporary-base', snapshot: { id: 'base', sourceSession: 'source', path: '/base', sourceTurn: 't' } };
+  for (const archived of [false, true]) for (const source of CLEANUP_SOURCE_KINDS) {
+    let deleted = false;
+    const client = { request: async (method, params) => {
+      if (method === 'thread/read') return { thread: { id: 'base', forkedFromId: 'source', path: '/base' } };
+      if (method === 'thread/turns/list') return { data: [{ id: 't', status: 'completed' }] };
+      if (method === 'thread/list') {
+        assert.equal(params.ancestorThreadId, 'base');
+        assert.equal(params.useStateDbOnly, true);
+        assert.deepEqual(params.modelProviders, []);
+        const visible = params.archived === archived && params.sourceKinds.includes(source);
+        return { data: visible ? [{ id: 'child', source }] : [], nextCursor: null };
+      }
+      if (method === 'thread/delete') { deleted = true; return {}; }
+      throw new Error('Unexpected cleanup request');
+    } };
+    await assert.rejects(() => cleanSnapshot(client, job), /descendants/);
+    assert.equal(deleted, false, `${source} archived=${archived}`);
+  }
+});
+
+test('cleanup refuses incomplete descendant listings or a boundary changed during the checks', async () => {
+  const job = { purpose: 'modeltrace-temporary-base', snapshot: { id: 'base', sourceSession: 'source', path: '/base', sourceTurn: 't' } };
+  for (const variant of ['malformed', 'more-pages', 'changed']) {
+    let deleted = false, reads = 0;
+    const client = { request: async (method) => {
+      if (method === 'thread/read') return { thread: { id: 'base', forkedFromId: 'source', path: '/base' } };
+      if (method === 'thread/turns/list') return { data: [{ id: ++reads > 1 ? 'new-turn' : 't', status: 'completed' }] };
+      if (method === 'thread/list') return variant === 'malformed' ? {} : { data: [], nextCursor: variant === 'more-pages' ? 'more' : null };
+      if (method === 'thread/delete') { deleted = true; return {}; }
+      throw new Error('Unexpected cleanup request');
+    } };
+    await assert.rejects(() => cleanSnapshot(client, job), /descendants|changed during/);
+    assert.equal(deleted, false);
   }
 });
 
@@ -204,6 +412,69 @@ test('slow normal background probes allow work and final answers, deduplicate pa
   assert.equal(after.samples.length, 1); assert.equal(after.probeRun, null); assert.equal(after.pending, null);
   assert.equal(after.alerts.length, 0); assert.equal(f.counts().createdBase, 1);
   assert.deepEqual(f.threads.get(f.session).history, f.initialHistory);
+});
+
+test('background dispatch and result submission survive slow live writers without a foreground probe', { timeout: 30000 }, async (t) => {
+  const f = await fixture(t), { bank, analyzeGlobalOutputs } = await loadArtifacts();
+  await f.command('start', '--expected', analyzeGlobalOutputs([{ text: integers, expected_count: 300 }], bank).prediction);
+  const holdState = async () => {
+    const entered = deferred(), release = deferred();
+    const owner = withState(f.directory, f.session, async () => { entered.resolve(); await release.promise; });
+    await entered.promise;
+    return async () => { release.resolve(); await owner; };
+  };
+  const releaseDispatch = await holdState(), started = deferred(), finish = deferred();
+  let releaseSubmission, settled = false;
+  const worker = handleBackgroundHook(managementEvent(f, 'start'), f.directory, {}, {
+    ...f.dependencies,
+    generate: async (...args) => { started.resolve(); await finish.promise; return f.dependencies.generate(...args); },
+  }).then((output) => ({ output }), (error) => ({ error })).then((result) => { settled = true; return result; });
+  try {
+    await delay(1600); // Longer than the unchanged 1200ms foreground lock budget.
+    assert.equal(settled, false, 'dispatch must keep waiting for the active writer');
+    await releaseDispatch();
+    assert.equal(await Promise.race([started.promise.then(() => true), worker.then(() => false)]), true);
+    releaseSubmission = await holdState();
+    finish.resolve();
+    await delay(1600);
+    assert.equal(settled, false, 'result submission must also use the background lock budget');
+    await releaseSubmission();
+    const result = await worker;
+    assert.equal(result.error, undefined); assert.deepEqual(result.output, {});
+    const state = await readState(f.directory, f.session);
+    assert.equal(state.samples.length, 1); assert.equal(state.missed, 0); assert.equal(state.issued, 1);
+    assert.equal(state.alerts.length, 0); assert.equal(state.probeRun, null); assert.ok(state.lastBackgroundHookAt);
+    assert.equal(f.counts().createdBase, 1);
+    assert.deepEqual(f.threads.get(f.session).history, f.initialHistory);
+  } finally {
+    finish.resolve(); await releaseDispatch(); await releaseSubmission?.(); await worker;
+  }
+});
+
+test('a queued background result rechecks expiry after acquiring the state lock', { timeout: 15000 }, async (t) => {
+  const f = await fixture(t), pending = (await f.command('start')).pending;
+  const result = await runForkProbe(f.directory, f.session, pending.id, {}, {
+    ...f.dependencies, background: true,
+    submit: async (...args) => {
+      const entered = deferred(), expire = deferred(), expired = deferred(), release = deferred();
+      const owner = withState(f.directory, f.session, async (state) => {
+        entered.resolve(); await expire.promise;
+        state.pending.expiresAt = Date.now(); expired.resolve(); await release.promise;
+      });
+      await entered.promise;
+      const submission = submitForkResult(...args).then((value) => ({ value }), (error) => ({ error }));
+      try {
+        await delay(100); expire.resolve(); await expired.promise;
+      } finally { expire.resolve(); release.resolve(); await owner; }
+      const outcome = await submission;
+      if (outcome.error) throw outcome.error;
+      return outcome.value;
+    },
+  });
+  assert.equal(result.accepted, false); assert.match(result.reason, /expired/i);
+  const state = await readState(f.directory, f.session);
+  assert.equal(state.samples.length, 0); assert.equal(state.missed, 1); assert.equal(state.alerts.length, 0);
+  assert.equal(state.probeRun, null); assert.equal(state.pending, null);
 });
 
 test('background mismatch notifies before retry, then three mismatching retries halt using one frozen base', async (t) => {

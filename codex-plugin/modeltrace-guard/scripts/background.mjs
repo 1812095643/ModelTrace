@@ -2,7 +2,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { pendingAlerts, userNotice } from './alerts.mjs';
 import { controlContext, handleHook, notificationContext, submitForkResult } from './guard.mjs';
 import { runForkProbe } from './fork-runner.mjs';
-import { expirePending, processAlive, readState, withState } from './state.mjs';
+import { BACKGROUND_STATE_LOCK, expirePending, processAlive, readState, withState } from './state.mjs';
 import { summarize } from './status.mjs';
 
 export const BACKGROUND_EVENTS = ['SessionStart', 'UserPromptSubmit', 'PostToolUse'];
@@ -17,6 +17,11 @@ const injected = (event, context, message) => ({
 });
 
 async function backgroundNotice(event, directory, session, confirmationId) {
+  const observed = await readState(directory, session);
+  // Most hooks have nothing to deliver. Avoid an additional lock/fsync for an
+  // empty notification; a writer that commits a new alert delivers it itself.
+  if (!observed || (!pendingAlerts(observed).some((alert) => alert.lastDeliveryTurn !== (observed.turn || 'no-turn'))
+    && !observed.taskHalt && !(confirmationId && observed.confirmation?.id === confirmationId))) return {};
   return withState(directory, session, (state) => {
     const alerts = pendingAlerts(state).filter((alert) => alert.lastDeliveryTurn !== (state.turn || 'no-turn')).slice(0, 5);
     if (alerts.length) {
@@ -34,7 +39,7 @@ async function backgroundNotice(event, directory, session, confirmationId) {
       return injected(event, context + '\n' + JSON.stringify(state.confirmation));
     }
     return {};
-  });
+  }, BACKGROUND_STATE_LOCK);
 }
 
 // Called ONLY by command handlers declared async in hooks.json. Awaiting the
@@ -44,8 +49,7 @@ export async function handleBackgroundHook(event, directory, env = process.env, 
   if (event.agent_id || event.parent_session_id || env.MODELTRACE_PROBE_PROCESS === '1'
     || (env.CODEX_THREAD_ID && event.session_id !== env.CODEX_THREAD_ID)
     || !BACKGROUND_EVENTS.includes(event.hook_event_name)) return {};
-  const output = await handleHook(event, directory);
-  await withState(directory, event.session_id, (state) => { state.lastBackgroundHookAt = Date.now(); });
+  const output = await handleHook(event, directory, undefined, undefined, { background: true });
   // Deliver already-known alerts immediately, without delaying them for a probe.
   if (Object.keys(output).length) return output;
   const deadline = Date.now() + (dependencies.budgetMs ?? (BACKGROUND_TIMEOUT_SECONDS - 60) * 1000);

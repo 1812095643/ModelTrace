@@ -1,7 +1,5 @@
-import { createReadStream } from 'node:fs';
 import { mkdir, open, rename, unlink } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
-import { createInterface } from 'node:readline';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -14,24 +12,48 @@ export function cleanupPath(directory, id) {
   return path.join(path.resolve(directory), '_fork_cleanup', `${id}.json`);
 }
 
-async function sourceSettings(client, session) {
-  const { thread } = await client.request('thread/read', { threadId: session });
-  if (!thread.path || !path.isAbsolute(thread.path)) throw new Error('Source task has no persisted Codex history to fork');
-  let metadata, context;
-  for await (const line of createInterface({ input: createReadStream(thread.path), crlfDelay: Infinity })) {
-    if (!line.trim()) continue;
-    let event;
-    try { event = JSON.parse(line); } catch { continue; } // concurrent final JSONL write may be incomplete
-    if (event.type === 'session_meta') metadata ||= event.payload;
-    if (event.type === 'turn_context') context = event.payload;
+export async function sourceSettings(client, session) {
+  const { thread } = await client.request('thread/read', { threadId: session, includeTurns: false });
+  if (!thread || thread.id !== session) throw new Error('Codex returned metadata for a different source task');
+  if (thread.ephemeral || typeof thread.path !== 'string' || !path.isAbsolute(thread.path)) throw new Error('Source task has no persisted Codex history to fork');
+  const nonempty = (value) => typeof value === 'string' && Boolean(value.trim());
+  // thread/read exposes current/persisted task settings without returning turns.
+  // Never open the rollout or substitute config/read's global/project defaults.
+  if (!nonempty(thread.model) || !nonempty(thread.modelProvider)
+    || !Object.hasOwn(thread, 'reasoningEffort') || (thread.reasoningEffort !== null && !nonempty(thread.reasoningEffort))
+    || typeof thread.cwd !== 'string' || !path.isAbsolute(thread.cwd)) {
+    throw new Error('Codex source task metadata lacks model/provider/reasoning/workspace settings; no history scan or default-model fallback');
   }
-  if (!metadata || (metadata.id !== session && metadata.session_id !== session) || !context?.model || !metadata.model_provider) throw new Error('Source history lacks matching model/provider metadata; refusing default-model fallback');
-  return { model: context.model, provider: metadata.model_provider, effort: context.effort ?? context.reasoning_effort ?? null, cwd: context.cwd || metadata.cwd };
+  return { model: thread.model, provider: thread.modelProvider, effort: thread.reasoningEffort, cwd: thread.cwd };
 }
 
 export async function lastTurn(client, id) {
   const response = await client.request('thread/turns/list', { threadId: id, limit: 1, itemsView: 'notLoaded', sortDirection: 'desc' });
   return response.data[0] || null;
+}
+
+// The native fork preserves the effective context, including compaction.
+// This digest identifies its ordered turn boundaries, not its message bodies:
+// even one full turn can exceed V8's string limit, so smaller full pages do not suffice.
+export async function snapshotBoundaries(client, id, sourceTurn) {
+  const hash = createHash('sha256').update('modeltrace-turn-boundaries-v1\n');
+  const cursors = new Set(); let cursor, lastId, count = 0;
+  do {
+    const page = await client.request('thread/turns/list', { threadId: id, limit: 50, itemsView: 'notLoaded', sortDirection: 'asc', ...(cursor ? { cursor } : {}) }, 30000);
+    if (!Array.isArray(page.data)) throw new Error('Codex snapshot turn metadata is unavailable');
+    for (const turn of page.data) {
+      if (typeof turn.id !== 'string' || !turn.id || !['completed', 'interrupted', 'failed'].includes(turn.status)) throw new Error('Codex snapshot has an invalid or unfinished turn boundary');
+      hash.update(JSON.stringify([turn.id, turn.status]) + '\n');
+      lastId = turn.id; count++;
+    }
+    cursor = page.nextCursor;
+    if (cursor) {
+      if (typeof cursor !== 'string' || !page.data.length || cursors.has(cursor)) throw new Error('Codex snapshot turn pagination did not advance');
+      cursors.add(cursor);
+    }
+  } while (cursor);
+  if (!count || lastId !== sourceTurn) throw new Error('Codex snapshot boundary changed while reading turn metadata');
+  return { sha256: hash.digest('hex'), sha256Scope: 'turn_boundaries_v1', turnCount: count };
 }
 
 // Paginated histories reject copied rollout paths. Freeze using a native,
@@ -40,7 +62,7 @@ export async function freezeSnapshot(client, session, directory) {
   const settings = await sourceSettings(client, session);
   const response = await client.request('thread/fork', {
     threadId: session, excludeTurns: true, deferGoalContinuation: true,
-    model: settings.model, modelProvider: settings.provider,
+    model: settings.model, modelProvider: settings.provider, cwd: settings.cwd,
     ...(settings.effort ? { config: { model_reasoning_effort: settings.effort } } : {}),
   }, 30000);
   const base = response.thread;
@@ -49,22 +71,19 @@ export async function freezeSnapshot(client, session, directory) {
   await saveOwnership(directory, snapshot, 'active');
   try {
     const turn = await lastTurn(client, base.id);
-    if (!turn || turn.status === 'inProgress') throw new Error('Codex snapshot has no fixed completed/interrupted turn boundary');
+    if (!turn || typeof turn.id !== 'string' || !turn.id || !['completed', 'interrupted', 'failed'].includes(turn.status)) throw new Error('Codex snapshot has no fixed completed/interrupted turn boundary');
     snapshot.sourceTurn = turn.id;
-    const hash = createHash('sha256'); let cursor;
-    do {
-      const page = await client.request('thread/turns/list', { threadId: base.id, limit: 50, itemsView: 'full', sortDirection: 'asc', ...(cursor ? { cursor } : {}) }, 30000);
-      for (const item of page.data) hash.update(JSON.stringify(item) + '\n');
-      cursor = page.nextCursor;
-    } while (cursor);
-    snapshot.sha256 = hash.digest('hex');
+    // Persist deletion evidence before any further request. A terminated
+    // worker must not leave a safely owned base with an unknown boundary.
+    await saveOwnership(directory, snapshot, 'active');
+    Object.assign(snapshot, await snapshotBoundaries(client, base.id, snapshot.sourceTurn));
     await saveOwnership(directory, snapshot, 'active');
     return snapshot;
   } catch (error) { await removeSnapshot(directory, snapshot); throw error; }
 }
 
 export async function verifySnapshot(client, snapshot) {
-  const { thread } = await client.request('thread/read', { threadId: snapshot.id });
+  const { thread } = await client.request('thread/read', { threadId: snapshot.id, includeTurns: false });
   const turn = await lastTurn(client, snapshot.id);
   if (thread.forkedFromId !== snapshot.sourceSession || thread.id === snapshot.sourceSession || thread.ephemeral || thread.path !== snapshot.path
     || turn?.id !== snapshot.sourceTurn || turn.status === 'inProgress') throw new Error('Frozen Codex snapshot changed or is unavailable; refusing to fork a different context');
@@ -100,6 +119,6 @@ export function dispatchQueuedCleanups() {
 
 export function publicSnapshot(snapshot) {
   if (!snapshot) return null;
-  const { id, sha256, capturedAt, boundary, sourceTurn } = snapshot;
-  return { id, sha256, capturedAt, boundary, sourceTurn };
+  const { id, sha256, sha256Scope, turnCount, capturedAt, boundary, sourceTurn } = snapshot;
+  return { id, sha256, sha256Scope, turnCount, capturedAt, boundary, sourceTurn };
 }

@@ -1,7 +1,9 @@
 import { spawn } from 'node:child_process';
-import { createInterface } from 'node:readline';
 import { access, readdir } from 'node:fs/promises';
 import path from 'node:path';
+import { readProtocolLines } from './protocol-lines.mjs';
+
+export const CODEX_CLIENT_INFO = Object.freeze({ name: 'modeltrace_guard', version: '0.1.2' });
 
 // Use Codex's own transport and configured account/provider, never a parallel
 // hand-written Responses/Chat client. Do not print protocol history or stderr.
@@ -26,51 +28,70 @@ export async function codexExecutable(env = process.env) {
 }
 
 export class AppServerClient {
-  constructor(child) {
-    this.child = child; this.nextId = 0; this.pending = new Map(); this.listeners = new Set(); this.closed = false; this.allowedTurns = new Set();
-    this.lines = createInterface({ input: child.stdout });
-    child.stderr.resume();
-    this.lines.on('line', (line) => {
-      let message;
-      try { message = JSON.parse(line); } catch { return; }
+  constructor(child, protocolOptions = {}) {
+    this.child = child; this.nextId = 0; this.pending = new Map(); this.listeners = new Set(); this.closed = false; this.allowedTurns = new Set(); this.failure = null;
+    const rejectPending = (error) => {
+      for (const waiting of this.pending.values()) { clearTimeout(waiting.timer); waiting.reject(error); }
+      this.pending.clear();
+    };
+    const fail = (error) => {
+      if (this.failure || this.closed) return;
+      this.failure = error;
+      rejectPending(error);
+      this.lines?.close();
+      child.kill();
+    };
+    this.exited = new Promise((resolve) => {
+      const finish = () => {
+        if (this.closed) return;
+        this.closed = true; this.lines?.close();
+        rejectPending(this.failure || new Error('Codex probe transport closed'));
+        resolve();
+      };
+      child.once('exit', finish); child.once('error', finish);
+    });
+    this.lines = readProtocolLines(child.stdout, (message) => {
       const waiting = this.pending.get(message.id);
       if (waiting && !message.method) {
         this.pending.delete(message.id); clearTimeout(waiting.timer);
-        if (message.error) waiting.reject(new Error(`Codex ${waiting.method}: ${message.error.message}`));
+        if (message.error) {
+          if (waiting.method === 'turn/start') this.allowedTurns.delete(waiting.threadId);
+          waiting.reject(new Error(`Codex ${waiting.method}: ${message.error.message}`));
+        }
         else waiting.resolve(message.result);
       } else if (message.method) {
-        if (message.method === 'turn/started' && !this.allowedTurns.has(message.params?.threadId)) {
-          // A baseline/doctor must never trigger an inherited automatic goal.
-          child.kill(); return;
+        if (message.method === 'turn/started') {
+          // One explicit request permits one turn, not automatic continuation.
+          if (!this.allowedTurns.delete(message.params?.threadId)) {
+            const error = new Error('Codex probe attempted an unrequested turn; no sample accepted');
+            error.code = 'MODELTRACE_UNREQUESTED_TURN';
+            fail(error); return;
+          }
         }
         // A probe is text-only. Never approve a server-initiated tool/permission request.
         if (message.id !== undefined) this.write({ id: message.id, error: { code: -32601, message: 'ModelTrace probes do not execute tools or grant permissions' } });
         for (const listener of this.listeners) listener(message);
       }
-    });
-    this.exited = new Promise((resolve) => {
-      const finish = () => {
-        if (this.closed) return;
-        this.closed = true;
-        for (const waiting of this.pending.values()) { clearTimeout(waiting.timer); waiting.reject(new Error('Codex probe transport closed')); }
-        this.pending.clear(); resolve();
-      };
-      child.once('exit', finish); child.once('error', finish);
-    });
-    child.stdin.on('error', () => {});
+    }, fail, protocolOptions);
+    child.stderr.resume();
+    child.stdin.on('error', (error) => { if (!this.closing) fail(error); });
   }
-  write(message) { if (!this.closed) this.child.stdin.write(JSON.stringify(message) + '\n'); }
+  write(message) { if (this.failure) throw this.failure; if (!this.closed) this.child.stdin.write(JSON.stringify(message) + '\n'); }
   request(method, params = {}, timeout = 15000) {
+    if (this.failure) return Promise.reject(this.failure);
     if (this.closed) return Promise.reject(new Error('Codex probe transport is closed'));
     if (method === 'turn/start') this.allowedTurns.add(params.threadId);
     return new Promise((resolve, reject) => {
       const id = ++this.nextId;
-      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`Codex ${method} timed out`)); }, timeout);
-      this.pending.set(id, { resolve, reject, timer, method }); this.write({ id, method, params });
+      const timer = setTimeout(() => { this.pending.delete(id); if (method === 'turn/start') this.allowedTurns.delete(params.threadId); reject(new Error(`Codex ${method} timed out`)); }, timeout);
+      this.pending.set(id, { resolve, reject, timer, method, threadId: params.threadId });
+      try { this.write({ id, method, params }); }
+      catch (error) { this.pending.delete(id); clearTimeout(timer); if (method === 'turn/start') this.allowedTurns.delete(params.threadId); reject(error); }
     });
   }
   async close() {
     if (this.closed) return;
+    this.closing = true;
     this.child.stdin.end();
     let timer;
     await Promise.race([this.exited, new Promise((resolve) => { timer = setTimeout(resolve, 2000); })]);
@@ -91,7 +112,7 @@ export async function openAppServer(env = process.env) {
   });
   const client = new AppServerClient(child);
   try {
-    await client.request('initialize', { clientInfo: { name: 'modeltrace_guard', version: '0.1.1' }, capabilities: { experimentalApi: true } });
+    await client.request('initialize', { clientInfo: CODEX_CLIENT_INFO, capabilities: { experimentalApi: true } });
     client.write({ method: 'initialized' });
     return client;
   } catch (error) { await client.close(); throw error; }

@@ -4,25 +4,34 @@ import { fileURLToPath } from 'node:url';
 import { openAppServer } from './app-server-client.mjs';
 import { freezeSnapshot, publicSnapshot, removeSnapshot, verifySnapshot } from './fork-snapshot.mjs';
 import { forkPrompt } from './prompts.mjs';
-import { abandon, digest, interruptConfirmation, processAlive, readState, record, schedule, withState } from './state.mjs';
+import { BACKGROUND_STATE_LOCK, abandon, digest, interruptConfirmation, processAlive, readState, record, schedule, withState } from './state.mjs';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 export function forkParameters(snapshot) {
   return {
+    // Native ephemeral forks reject deferGoalContinuation. The transport only
+    // permits the one turn explicitly requested for this disposable fork.
     threadId: snapshot.id, lastTurnId: snapshot.sourceTurn, ephemeral: true, excludeTurns: true,
-    model: snapshot.model, modelProvider: snapshot.provider,
+    model: snapshot.model, modelProvider: snapshot.provider, cwd: snapshot.cwd,
     ...(snapshot.effort ? { config: { model_reasoning_effort: snapshot.effort } } : {}),
   };
 }
 
 export function verifyFork(response, snapshot) {
-  if (!response?.thread?.ephemeral || response.thread.path || response.thread.id === snapshot.sourceSession || response.thread.forkedFromId !== snapshot.id) throw new Error('Codex did not create a disposable in-memory fork');
+  if (!response?.thread?.ephemeral || !response.thread.id || response.thread.path || response.thread.id === snapshot.sourceSession || response.thread.id === snapshot.id || response.thread.forkedFromId !== snapshot.id) throw new Error('Codex did not create a disposable in-memory fork');
   if (response.model !== snapshot.model || response.modelProvider !== snapshot.provider || (snapshot.effort && response.reasoningEffort !== snapshot.effort)) throw new Error('Codex fork model/provider/reasoning settings differ from the source snapshot');
+  if (response.cwd !== snapshot.cwd || response.thread.cwd !== snapshot.cwd) throw new Error('Codex fork workspace differs from the source snapshot');
   return {
-    model: response.model, provider: response.modelProvider, effort: response.reasoningEffort ?? null,
+    model: response.model, provider: response.modelProvider, effort: response.reasoningEffort ?? null, cwd: response.cwd,
     serviceTier: response.serviceTier ?? null,
     instructionSourcesSha256: digest(JSON.stringify(response.instructionSources || [])),
   };
+}
+
+export async function prepareProbeFork(client, snapshot) {
+  const response = await client.request('thread/fork', forkParameters(snapshot), 30000);
+  const effective = verifyFork(response, snapshot);
+  return { response, effective };
 }
 
 export async function requireTrustedGuard(client, cwd) {
@@ -49,8 +58,7 @@ export async function forkDoctor(session, directory, env = process.env) {
   try {
     snapshot = await freezeSnapshot(client, session, directory);
     await verifySnapshot(client, snapshot);
-    const response = await client.request('thread/fork', forkParameters(snapshot), 30000);
-    const effective = verifyFork(response, snapshot);
+    const { effective } = await prepareProbeFork(client, snapshot);
     let toolsBlocked = false, hookError = null;
     try { await requireTrustedGuard(client, snapshot.cwd); toolsBlocked = true; } catch (error) { hookError = error.message; }
     return { forkAvailable: true, ready: toolsBlocked, toolsBlocked, backgroundHooksReady: toolsBlocked, hookError, snapshot: publicSnapshot(snapshot), effective, inferenceRequests: 0, cleanup: 'Temporary inference process closed; native base deletion queued with an ownership check' };
@@ -116,8 +124,10 @@ export async function runForkProbe(directory, session, challenge, env = process.
   const connect = dependencies.connect || openAppServer;
   const enforceTrust = dependencies.enforceTrust || requireTrustedGuard;
   const generate = dependencies.generate || generateProbe;
+  const stateOptions = dependencies.background ? BACKGROUND_STATE_LOCK : undefined;
+  const updateState = (callback) => withState(directory, session, callback, stateOptions);
   let client, snapshot, pending, receipt, text, cleanupConfirmed = false;
-  const claimed = await withState(directory, session, (state) => {
+  const claimed = await updateState((state) => {
     // Parallel background hooks race for one atomic checkpoint lease. A losing
     // contender must not report an error or cancel the winning worker's batch.
     if (dependencies.background && (!state.enabled || state.taskHalt || !state.pending || state.pending.id !== challenge
@@ -135,19 +145,18 @@ export async function runForkProbe(directory, session, challenge, env = process.
     client = await connect(env);
     if (!snapshot) {
       snapshot = await freezeSnapshot(client, session, directory);
-      await withState(directory, session, (state) => {
+      await updateState((state) => {
         if (!state.enabled || state.pending?.id !== challenge || state.pending.epoch !== pending.epoch) throw new Error('Checkpoint changed before snapshot capture');
-        if (state.model && state.model !== snapshot.model) throw new Error('Source rollout model is not the currently reported model; wait for history to flush');
+        if (state.model && state.model !== snapshot.model) throw new Error('Source task model metadata differs from the active hook model; wait for task metadata to synchronize');
         if (!state.model) { state.model = snapshot.model; if (state.expectedSource === 'auto') state.expected = state.model; }
         state.forkSnapshot = snapshot;
         record(state, 'fork_snapshot_frozen', Date.now(), publicSnapshot(snapshot));
       });
     }
     await verifySnapshot(client, snapshot);
-    const fork = await client.request('thread/fork', forkParameters(snapshot), 30000);
-    const effective = verifyFork(fork, snapshot);
+    const { response: fork, effective } = await prepareProbeFork(client, snapshot);
     await enforceTrust(client, snapshot.cwd);
-    await withState(directory, session, (state) => {
+    await updateState((state) => {
       if (!state.enabled || state.pending?.id !== challenge) throw new Error('Checkpoint cancelled');
       if (Date.now() >= state.pending.expiresAt) throw new Error('Checkpoint expired during fork preparation');
       if (state.forkSnapshot.effective && JSON.stringify(state.forkSnapshot.effective) !== JSON.stringify(effective)) throw new Error('Fork settings changed within the retry batch');
@@ -162,10 +171,10 @@ export async function runForkProbe(directory, session, challenge, env = process.
     await client.close(); cleanupConfirmed = true;
     receipt = { mode: 'ephemeral_fork', snapshot: publicSnapshot(snapshot), effective, cleanedUp: true, usage: generated.usage || null,
       cacheHit: generated.usage ? generated.usage.cachedInputTokens > 0 : null, routingScope: 'fork_continuation' };
-    const result = await dependencies.submit(directory, session, challenge, text, receipt);
+    const result = await dependencies.submit(directory, session, challenge, text, receipt, stateOptions);
     return result;
   } catch (error) {
-    const cancelled = await withState(directory, session, (state) => {
+    const cancelled = await updateState((state) => {
       if (!state.enabled || state.pending?.id !== challenge || state.epoch !== pending.epoch) return true;
       abandon(state, Date.now(), 'fork_probe_failed');
       interruptConfirmation(state, Date.now(), 'fork_probe_failed'); schedule(state, Date.now());
@@ -178,7 +187,7 @@ export async function runForkProbe(directory, session, challenge, env = process.
   } finally {
     try { if (client && !cleanupConfirmed) await client.close(); }
     finally {
-      await withState(directory, session, async (state) => {
+      await updateState(async (state) => {
         if (state.probeRun?.challenge === challenge) state.probeRun = null;
         if (state.confirmation?.status !== 'active' || !state.enabled || state.taskHalt) {
           if (snapshot) state.forkCleanup = { id: snapshot.id, status: 'pending', at: Date.now() };
