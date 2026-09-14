@@ -25,20 +25,23 @@ export function verifyFork(response, snapshot) {
   };
 }
 
-async function requireTrustedGuard(client, cwd) {
+export async function requireTrustedGuard(client, cwd) {
   const listing = await client.request('hooks/list', { cwds: [cwd] });
-  const candidates = (listing.data || []).flatMap((entry) => entry.hooks || []).filter((hook) =>
-    hook.eventName === 'preToolUse' && hook.enabled && ['trusted', 'managed'].includes(hook.trustStatus)
+  const hooks = (listing.data || []).flatMap((entry) => entry.hooks || []).filter((hook) =>
+    hook.enabled && ['trusted', 'managed'].includes(hook.trustStatus)
     && /^modeltrace-guard(?:@|$)/.test(hook.pluginId || '') && hook.handlerType === 'command'
     && (!hook.matcher || hook.matcher === '.*'));
+  const candidates = hooks.filter((hook) => hook.eventName === 'preToolUse' && hook.async === false);
   const expected = digest(await readFile(path.join(ROOT, 'scripts', 'guard.mjs')));
   for (const hook of candidates) {
     try {
       const installed = path.resolve(path.dirname(hook.sourcePath), '../scripts/guard.mjs');
-      if (digest(await readFile(installed)) === expected && hook.command.includes('guard.mjs')) return;
+      const backgroundReady = ['sessionStart', 'userPromptSubmit', 'postToolUse'].every((event) =>
+        hooks.some((item) => item.sourcePath === hook.sourcePath && item.eventName === event && item.async === true && item.command.includes('background-hook')));
+      if (backgroundReady && digest(await readFile(installed)) === expected && hook.command.includes('guard.mjs')) return;
     } catch {}
   }
-  throw new Error('Fork guard is not trusted or is an older version. Reload the updated plugin and review its PreToolUse hook in /hooks before probing.');
+  throw new Error('The synchronous PreToolUse guard and native async background hooks must be loaded and trusted. Reload the updated plugin, use a Codex runtime with async hook support, and review ModelTrace Guard in /hooks before probing.');
 }
 
 export async function forkDoctor(session, directory, env = process.env) {
@@ -50,13 +53,14 @@ export async function forkDoctor(session, directory, env = process.env) {
     const effective = verifyFork(response, snapshot);
     let toolsBlocked = false, hookError = null;
     try { await requireTrustedGuard(client, snapshot.cwd); toolsBlocked = true; } catch (error) { hookError = error.message; }
-    return { forkAvailable: true, ready: toolsBlocked, toolsBlocked, hookError, snapshot: publicSnapshot(snapshot), effective, inferenceRequests: 0, cleanup: 'Temporary inference process closed; native base deletion queued with an ownership check' };
+    return { forkAvailable: true, ready: toolsBlocked, toolsBlocked, backgroundHooksReady: toolsBlocked, hookError, snapshot: publicSnapshot(snapshot), effective, inferenceRequests: 0, cleanup: 'Temporary inference process closed; native base deletion queued with an ownership check' };
   } finally { try { await client.close(); } finally { await removeSnapshot(directory, snapshot); } }
 }
 
 // Exported for protocol fixtures: notifications may arrive before turn/start's
 // response. Keep the listener installed first; never leak raw text to stdout.
 export async function generateProbe(client, forkId, pending, isCancelled = async () => false) {
+  if (Date.now() >= pending.expiresAt || await isCancelled()) throw new Error('Probe cancelled or expired before inference');
   let resolve, reject, settled = false, finalText = null, otherText = [], turnId;
   const usageByTurn = new Map();
   const completed = new Promise((yes, no) => { resolve = yes; reject = no; });
@@ -113,14 +117,20 @@ export async function runForkProbe(directory, session, challenge, env = process.
   const enforceTrust = dependencies.enforceTrust || requireTrustedGuard;
   const generate = dependencies.generate || generateProbe;
   let client, snapshot, pending, receipt, text, cleanupConfirmed = false;
-  await withState(directory, session, (state) => {
+  const claimed = await withState(directory, session, (state) => {
+    // Parallel background hooks race for one atomic checkpoint lease. A losing
+    // contender must not report an error or cancel the winning worker's batch.
+    if (dependencies.background && (!state.enabled || state.taskHalt || !state.pending || state.pending.id !== challenge
+      || (state.probeRun && processAlive(state.probeRun.pid)))) return false;
     if (!state.enabled || state.taskHalt || !state.pending || state.pending.id !== challenge) throw new Error('No matching live fork checkpoint');
     if (state.probeRun && processAlive(state.probeRun.pid)) throw new Error('A fork probe is already running for this task');
     if (Date.now() >= state.pending.expiresAt) throw new Error('Checkpoint has expired');
     if (state.pending.confirmationId && !state.forkSnapshot) throw new Error('Retry snapshot is missing; a fresh snapshot cannot replace it');
     state.probeRun = { pid: process.pid, challenge, startedAt: Date.now() };
     pending = structuredClone(state.pending); snapshot = state.forkSnapshot;
+    return true;
   });
+  if (!claimed) return { skipped: true };
   try {
     client = await connect(env);
     if (!snapshot) {
@@ -139,6 +149,7 @@ export async function runForkProbe(directory, session, challenge, env = process.
     await enforceTrust(client, snapshot.cwd);
     await withState(directory, session, (state) => {
       if (!state.enabled || state.pending?.id !== challenge) throw new Error('Checkpoint cancelled');
+      if (Date.now() >= state.pending.expiresAt) throw new Error('Checkpoint expired during fork preparation');
       if (state.forkSnapshot.effective && JSON.stringify(state.forkSnapshot.effective) !== JSON.stringify(effective)) throw new Error('Fork settings changed within the retry batch');
       state.forkSnapshot.effective = effective;
       state.forkHealth = { checkedAt: Date.now(), ready: true, boundary: 'persisted_rollout', toolsBlocked: true };
@@ -154,12 +165,15 @@ export async function runForkProbe(directory, session, challenge, env = process.
     const result = await dependencies.submit(directory, session, challenge, text, receipt);
     return result;
   } catch (error) {
-    await withState(directory, session, (state) => {
-      if (state.pending?.id === challenge) abandon(state, Date.now(), 'fork_probe_failed');
+    const cancelled = await withState(directory, session, (state) => {
+      if (!state.enabled || state.pending?.id !== challenge || state.epoch !== pending.epoch) return true;
+      abandon(state, Date.now(), 'fork_probe_failed');
       interruptConfirmation(state, Date.now(), 'fork_probe_failed'); schedule(state, Date.now());
       state.forkHealth = { ready: false, checkedAt: Date.now(), error: error.message };
       record(state, 'fork_probe_failed', Date.now(), { challenge, reason: error.message });
+      return false;
     });
+    if (cancelled) return { accepted: false, cancelled: true };
     return { accepted: false, reason: error.message, agentAction: 'report_coverage_gap', instruction: 'Tell the user this fork checkpoint failed. Do not generate numbers in the main task or substitute a new API conversation.' };
   } finally {
     try { if (client && !cleanupConfirmed) await client.close(); }

@@ -36,6 +36,7 @@ export async function cleanupPending(directory, env = process.env, { retryBlocke
       if (job.status === 'active' && processAlive(job.ownerPid)) continue;
       if (job.status === 'active') {
         const state = await readState(directory, job.snapshot.sourceSession);
+        if (state?.forkSnapshot?.id === job.snapshot.id && state.probeRun && processAlive(state.probeRun.pid)) continue;
         if (state?.forkSnapshot?.id === job.snapshot.id && state.enabled && state.confirmation?.status === 'active'
           && Date.now() < (state.confirmation.startedAt + Math.max(600000, (state.confirmation.target + 1) * state.config.pendingSeconds * 1000))) continue;
       }

@@ -102,7 +102,8 @@ test('ten localized prompts preserve count/range/submission, can be sampled indi
     const context = challengeContext(state, '/tmp/test');
     assert.ok(forkPrompt(language, state.pending.count).includes('292') && forkPrompt(language, state.pending.count).includes('355'));
     assert.ok(context.includes(state.pending.id));
-    assert.ok(context.includes('probe --session'));
+    assert.ok(context.includes('background hook'));
+    assert.ok(!context.includes('probe --session'));
     assert.ok(!context.includes('--numbers'));
   }
   assert.throws(() => localizedPrompt('xx', 300, 'command'));
@@ -117,24 +118,21 @@ test('inactive hook is silent, records heartbeat, never probes', async (t) => {
   assert.ok(!JSON.stringify(state).includes('sensitive task text'));
 });
 
-test('real hook context targets same session and keeps all previous context, no API', async (t) => {
+test('due hooks queue a same-task checkpoint without a foreground command or context injection', async (t) => {
   const dir = await fixture(t);
   await active(dir, 1000);
   await handleHook(event('PostToolUse', { tool_use_id: 'a' }), dir, 1001, minimum);
   const output = await handleHook(event('PostToolUse', { tool_use_id: 'b' }), dir, 1002, minimum);
-  assert.equal(output.hookSpecificOutput.hookEventName, 'PostToolUse');
-  const context = output.hookSpecificOutput.additionalContext;
-  assert.ok(context.includes(session));
-  assert.ok(context.includes('existing context'));
-  assert.equal(output.decision, undefined);
-  assert.equal((await readState(dir, session)).issued, 1);
+  assert.deepEqual(output, {});
+  const state = await readState(dir, session);
+  assert.equal(state.issued, 1); assert.equal(state.session, session); assert.ok(state.pending);
 });
 
 test('parallel completions issue one checkpoint and replayed event is deduplicated', async (t) => {
   const dir = await fixture(t);
   await active(dir);
   const outputs = await Promise.all(['a', 'b', 'c'].map((id) => handleHook(event('PostToolUse', { tool_use_id: id }), dir)));
-  assert.equal(outputs.filter((output) => output.hookSpecificOutput).length, 1);
+  assert.ok(outputs.every((output) => Object.keys(output).length === 0));
   await handleHook(event('PostToolUse', { tool_use_id: 'c' }), dir);
   const state = await readState(dir, session);
   assert.equal(state.workTools, 3);
@@ -180,6 +178,18 @@ test('model changes segment comparisons and preserve previous sample history', a
   assert.equal(state.pending.epoch, 2);
 });
 
+test('late background events count tools without rolling back a newer turn or model', async (t) => {
+  const dir = await fixture(t); await active(dir, 1000);
+  await handleHook(event('UserPromptSubmit', { turn_id: 'turn-2', model: 'new-model' }), dir, 1001, minimum);
+  const current = await readState(dir, session);
+  await handleHook(event('PostToolUse', { turn_id: 'turn-1', model: 'gpt-5.4', tool_use_id: 'late-tool' }), dir, 1002, minimum);
+  await handleHook(event('SessionStart', { turn_id: 'turn-1', source: 'resume' }), dir, 1003, minimum);
+  const after = await readState(dir, session);
+  assert.equal(after.turn, 'turn-2'); assert.equal(after.model, 'new-model'); assert.equal(after.expected, 'new-model');
+  assert.equal(after.workTools, current.workTools + 1); assert.equal(after.epoch, current.epoch);
+  assert.deepEqual(after.pending, current.pending); assert.equal(after.missed, current.missed);
+});
+
 test('explicit expected model is not silently replaced by model field', async (t) => {
   const dir = await fixture(t);
   await active(dir);
@@ -195,20 +205,22 @@ test('compaction drops pending, suspends probes, then starts a new epoch', async
   await handleHook(event('PreCompact'), dir, 1001, minimum);
   assert.deepEqual(await handleHook(event('PostToolUse'), dir, 1002, minimum), {});
   const output = await handleHook(event('SessionStart', { source: 'compact' }), dir, 1003, minimum);
-  assert.equal(output.hookSpecificOutput.hookEventName, 'SessionStart');
+  assert.deepEqual(output, {});
   const state = await readState(dir, session);
   assert.equal(state.epoch, 2); assert.equal(state.missed, 1); assert.equal(state.compacting, false);
 });
 
-test('end-of-turn continuation is strictly bounded even if model fails to submit', async (t) => {
+test('normal pending probes never block Stop, get abandoned by it, or force extra probes', async (t) => {
   const dir = await fixture(t);
   await active(dir, 1000);
-  await withState(dir, session, (s) => { s.forceProbe = true; });
+  await withState(dir, session, (s) => { s.forceProbe = true; issue(s, 1000, minimum); });
+  const pending = (await readState(dir, session)).pending;
   const first = await handleHook(event('Stop'), dir, 1001, minimum);
-  assert.equal(first.decision, 'block');
+  assert.deepEqual(first, {});
   assert.deepEqual(await handleHook(event('Stop', { stop_hook_active: true }), dir, 1002, minimum), {});
   assert.deepEqual(await handleHook(event('Stop'), dir, 1003, minimum), {});
-  assert.equal((await readState(dir, session)).missed, 1);
+  const state = await readState(dir, session);
+  assert.equal(state.missed, 0); assert.equal(state.issued, 1); assert.deepEqual(state.pending, pending);
 });
 
 test('ordinary probes keep running past retired turn and total caps without resetting counts', async (t) => {
@@ -316,10 +328,14 @@ test('wrong task, wrong challenge, subagent and corrupt state fail safely', asyn
   assert.equal(await readFile(sessionPath(dir, 'broken'), 'utf8'), 'not json');
 });
 
-test('checksum bank and original scorer assets are valid, updated o-series included in gpt family', async () => {
+test('checksum bank and scorer are valid and packaged GPT/o-series families are normalized', async () => {
   const { bank, metadata } = await loadArtifacts();
   assert.equal(bank.models.length, metadata.modelCount);
-  for (const id of ['o1', 'o3', 'o3-mini', 'o4-mini']) assert.equal(bank.models.find((model) => model.id === id).family, 'gpt');
+  assert.ok(bank.models.length > 0);
+  assert.equal(new Set(bank.models.map((model) => model.id)).size, bank.models.length);
+  const gpt = bank.models.filter((model) => /^(?:gpt-|o\d)/.test(model.id));
+  assert.ok(gpt.length > 0);
+  for (const model of gpt) assert.equal(model.family, 'gpt', model.id);
 });
 
 test('stable data path is shared between hooks and task shell even with PLUGIN_DATA differences', () => {

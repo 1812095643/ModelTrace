@@ -55,7 +55,7 @@ test('default three extra retries follow immediate notification and end in a per
   const { dir, initial } = await startMismatch(t);
   assert.equal(initial.confirmation.target, 3);
   assert.match(initial.notificationContext, /NOTIFY THE USER NOW/);
-  assert.match(initial.controlContext, /3 follow-up probes/);
+  assert.match(initial.controlContext, /3 background follow-up probes/);
   const afterSubmitHook = await handleHook(event('PostToolUse', { tool_name: 'exec_command', tool_input: { cmd: 'node guard.mjs submit' } }), dir);
   assert.match(afterSubmitHook.hookSpecificOutput.additionalContext, /NOTIFY THE USER NOW/);
   assert.equal((await readState(dir, session)).pending, null);
@@ -65,7 +65,8 @@ test('default three extra retries follow immediate notification and end in a per
     assert.equal(ack.pending.retryIndex, retry); assert.equal(ack.pending.retryTarget, 3);
     assert.equal(ack.pending.confirmationId, initial.sample.challenge);
     assert.match(ack.challengeContext, new RegExp(`retry ${retry}/3`));
-    assert.match(ack.challengeContext, /After submitting, follow the returned notificationContext/);
+    assert.match(ack.challengeContext, /background hook/);
+    assert.match(ack.controlContext, /wait --session/);
     assert.equal(ack.pending.language, initial.sample.language);
     assert.equal(ack.pending.count, initial.sample.requestedCount);
     challenges.add(ack.pending.id);

@@ -62,7 +62,7 @@ test('shipped dashboard loads retry default and renders active, completed, inter
   assert.match(nodes['confirmation-note'].textContent, /等待智能体告知用户并确认提醒/);
   state.pendingNotifications = 0;
   context.renderConfirmation(state);
-  assert.match(nodes['confirmation-note'].textContent, /等待下一次复测/);
+  assert.match(nodes['confirmation-note'].textContent, /等待下一次后台复测/);
   state.frequency.retryCount = 7; state.confirmation.results = [{ mismatch: true }, { mismatch: false }];
   context.renderConfirmation(state);
   assert.equal(nodes['confirmation-status'].textContent, '复测 2 / 3');
@@ -104,4 +104,14 @@ test('actual form submits configurable retry counts and tool intervals without t
     assert.match(nodes['save-message'].textContent, /异常复测次数需为/);
   }
   assert.equal(calls.length, requestCount, 'invalid retry settings do not reach the API');
+});
+
+test('dashboard distinguishes a queued probe, a live background worker and no pending work', async () => {
+  const { context, nodes, state } = await fixture();
+  state.pending = { id: 'queued-checkpoint' }; state.background = { running: false };
+  context.render(state); assert.match(nodes['sample-note'].textContent, /已排队/);
+  state.background.running = true;
+  context.render(state); assert.match(nodes['sample-note'].textContent, /正在检测/);
+  state.pending = null; state.background.running = false;
+  context.render(state); assert.match(nodes['sample-note'].textContent, /无在途探针/);
 });

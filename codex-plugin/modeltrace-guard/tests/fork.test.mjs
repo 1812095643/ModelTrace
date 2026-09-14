@@ -4,10 +4,11 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { run, handleHook, loadArtifacts, submitForkResult } from '../scripts/guard.mjs';
-import { readState, withState } from '../scripts/state.mjs';
-import { runForkProbe, forkParameters, verifyFork, generateProbe } from '../scripts/fork-runner.mjs';
-import { cleanSnapshot } from '../scripts/fork-cleanup.mjs';
+import { ROOT, run, handleHook, loadArtifacts, submitForkResult, summarize } from '../scripts/guard.mjs';
+import { readState, withState, processAlive } from '../scripts/state.mjs';
+import { runForkProbe, forkParameters, verifyFork, generateProbe, requireTrustedGuard } from '../scripts/fork-runner.mjs';
+import { BACKGROUND_EVENTS, BACKGROUND_TIMEOUT_SECONDS, handleBackgroundHook, waitForConfirmation } from '../scripts/background.mjs';
+import { cleanSnapshot, cleanupPending } from '../scripts/fork-cleanup.mjs';
 import { cleanupPath } from '../scripts/fork-snapshot.mjs';
 
 // In-memory protocol double. No Codex process, provider, API or real task is
@@ -158,4 +159,217 @@ test('token usage inherited from a previous turn is never reported as the probe 
   } };
   const result = await generateProbe(client, 'fork', { expiresAt: Date.now() + 5000, language: 'en', count: 300 });
   assert.equal(result.usage, null);
+});
+
+const backgroundEvent = (f, extra = {}) => ({ session_id: f.session, hook_event_name: 'PostToolUse', turn_id: 'work-turn', tool_use_id: randomUUID(), ...extra });
+const managementEvent = (f, command) => backgroundEvent(f, { tool_name: 'exec_command', tool_input: { cmd: `node guard.mjs ${command}` } });
+const deferred = () => { let resolve; const promise = new Promise((yes) => { resolve = yes; }); return { promise, resolve }; };
+
+test('only probe-trigger hooks are native async; tool blocking and cancellation remain synchronous', async () => {
+  const config = JSON.parse(await readFile(path.join(ROOT, 'hooks/hooks.json'), 'utf8'));
+  for (const [event, groups] of Object.entries(config.hooks)) {
+    for (const group of groups) for (const handler of group.hooks) {
+      assert.equal(handler.async === true, BACKGROUND_EVENTS.includes(event), event);
+      assert.equal(handler.command.includes("main(['background-hook'])"), BACKGROUND_EVENTS.includes(event), event);
+      if (handler.async) assert.equal(handler.timeout, BACKGROUND_TIMEOUT_SECONDS);
+      else assert.ok(handler.timeout <= 5);
+    }
+  }
+  assert.ok(config.hooks.Interrupt[0].hooks[0].timeout <= 3);
+});
+
+test('slow normal background probes allow work and final answers, deduplicate parallel hooks, and return no context', { timeout: 10000 }, async (t) => {
+  const f = await fixture(t), { bank, analyzeGlobalOutputs } = await loadArtifacts();
+  const expected = analyzeGlobalOutputs([{ text: integers, expected_count: 300 }], bank).prediction;
+  const start = await f.command('start', '--expected', expected);
+  assert.ok(!start.challengeContext.includes('probe --session'));
+  const started = deferred(), finish = deferred();
+  const dependencies = { ...f.dependencies, generate: async (...args) => { started.resolve(); await finish.promise; return f.dependencies.generate(...args); } };
+  const worker = handleBackgroundHook(managementEvent(f, 'start'), f.directory, {}, dependencies);
+  let output;
+  try {
+    await started.promise;
+    const before = await readState(f.directory, f.session);
+    assert.equal(before.workTools, 0); assert.equal(before.probeRun.challenge, start.pending.id);
+    assert.equal(summarize(before, f.directory).background.running, true);
+    const duplicates = await Promise.all(Array.from({ length: 8 }, () => handleBackgroundHook(backgroundEvent(f), f.directory, {}, dependencies)));
+    for (const result of duplicates) assert.deepEqual(result, {});
+    assert.deepEqual(await handleHook(backgroundEvent(f, { hook_event_name: 'PreToolUse', tool_name: 'exec_command', tool_input: { cmd: 'do-original-work' } }), f.directory), {});
+    assert.deepEqual(await handleHook(backgroundEvent(f, { hook_event_name: 'Stop' }), f.directory), {});
+    const state = await readState(f.directory, f.session);
+    assert.equal(state.issued, 1); assert.equal(state.workTools, 8); assert.equal(state.missed, 0);
+  } finally { finish.resolve(); output = await worker; }
+  assert.deepEqual(output, {});
+  const after = await readState(f.directory, f.session);
+  assert.equal(after.samples.length, 1); assert.equal(after.probeRun, null); assert.equal(after.pending, null);
+  assert.equal(after.alerts.length, 0); assert.equal(f.counts().createdBase, 1);
+  assert.deepEqual(f.threads.get(f.session).history, f.initialHistory);
+});
+
+test('background mismatch notifies before retry, then three mismatching retries halt using one frozen base', async (t) => {
+  const f = await fixture(t);
+  await f.command('start', '--languages', 'en');
+  const notification = await handleBackgroundHook(managementEvent(f, 'start'), f.directory, {}, f.dependencies);
+  assert.ok(notification.systemMessage.includes(f.model));
+  assert.ok(notification.hookSpecificOutput.additionalContext.includes('acknowledge --session'));
+  let state = await readState(f.directory, f.session);
+  assert.equal(state.confirmation.target, 3); assert.equal(state.confirmation.results.length, 0); assert.equal(state.pending, null);
+  const base = state.forkSnapshot.id;
+  const work = backgroundEvent(f, { hook_event_name: 'PreToolUse', tool_name: 'exec_command', tool_input: { cmd: 'original-work' } });
+  assert.equal((await handleHook(work, f.directory)).hookSpecificOutput.permissionDecision, 'deny');
+  await handleBackgroundHook(backgroundEvent(f), f.directory, {}, f.dependencies);
+  assert.equal(f.generatedHistories.length, 1, 'no retry before visible-notification acknowledgement');
+  for (let i = 0; i < 3; i++) {
+    const alert = state.alerts.find((a) => !a.acknowledgedAt);
+    await f.command('acknowledge', '--alert', alert.id);
+    assert.equal((await handleHook(work, f.directory)).hookSpecificOutput.permissionDecision, 'deny', 'ack does not resume original work');
+    const output = await handleBackgroundHook(managementEvent(f, 'acknowledge'), f.directory, {}, f.dependencies);
+    assert.ok(output.systemMessage); assert.ok(!JSON.stringify(output).includes(integers));
+    state = await readState(f.directory, f.session);
+    assert.equal(state.confirmation.results.length, i + 1);
+    assert.equal(state.samples.at(-1).fork.snapshot.id, base);
+  }
+  assert.equal(state.taskHalt.retryCount, 3); assert.equal(state.pending, null);
+  assert.equal((await waitForConfirmation(f.directory, f.session, state.confirmation.id)).agentAction, 'stop_and_notify_user');
+  assert.equal(f.counts().createdBase, 1); assert.equal(f.generatedHistories.length, 4);
+  for (const history of f.generatedHistories) assert.deepEqual(history, f.initialHistory);
+  assert.deepEqual(f.threads.get(f.session).history, f.initialHistory);
+});
+
+test('matching background retries advance automatically and release the work guard only after the full batch', async (t) => {
+  const f = await fixture(t), { bank, analyzeGlobalOutputs } = await loadArtifacts();
+  const classify = (text) => analyzeGlobalOutputs([{ text, expected_count: 300 }], bank).prediction;
+  let matching;
+  for (let seed = 1; seed < 100; seed++) {
+    const text = JSON.stringify(Array.from({ length: 300 }, (_, i) => (i * seed + seed * 17) % 355 + 1));
+    if (classify(text) !== classify(integers)) { matching = text; break; }
+  }
+  assert.ok(matching, 'fixture must offer two distinct predictions in the packaged bank');
+  await f.command('start', '--expected', classify(matching));
+  await handleBackgroundHook(managementEvent(f, 'start'), f.directory, {}, f.dependencies);
+  const before = await readState(f.directory, f.session);
+  await f.command('acknowledge', '--alert', before.alerts[0].id);
+  const waiting = await waitForConfirmation(f.directory, f.session, before.confirmation.id, { timeoutMs: 0 });
+  assert.equal(waiting.waiting, true); assert.equal(f.generatedHistories.length, 1, 'wait never runs inference');
+  let generated = 0;
+  const output = await handleBackgroundHook(managementEvent(f, 'acknowledge'), f.directory, {}, {
+    ...f.dependencies, generate: async () => { generated++; return { text: matching }; },
+  });
+  assert.equal(generated, 3);
+  const state = await readState(f.directory, f.session);
+  assert.equal(state.confirmation.status, 'completed'); assert.equal(state.confirmation.allMismatch, false); assert.equal(state.taskHalt, null);
+  assert.equal(state.samples.length, 4); assert.equal(state.alerts.length, 1);
+  assert.equal(f.counts().createdBase, 1);
+  assert.ok(output.hookSpecificOutput.additionalContext.includes('background confirmation completed'));
+  assert.equal(output.systemMessage, undefined); assert.ok(!JSON.stringify(output).includes(matching));
+  assert.deepEqual(await handleHook(backgroundEvent(f, { hook_event_name: 'PreToolUse' }), f.directory), {});
+  assert.equal((await waitForConfirmation(f.directory, f.session, before.confirmation.id)).agentAction, 'confirmation_completed');
+});
+
+for (const cancel of ['stop', 'Interrupt', 'PreCompact', 'SessionEnd', 'comparison']) test(`background ${cancel} invalidates a late result without alerting or modifying the next checkpoint`, { timeout: 10000 }, async (t) => {
+  const f = await fixture(t), started = deferred(), finish = deferred();
+  await f.command('start');
+  const worker = handleBackgroundHook(managementEvent(f, 'start'), f.directory, {}, {
+    ...f.dependencies, generate: async () => { started.resolve(); await finish.promise; return { text: integers }; },
+  });
+  let output, next;
+  try {
+    await started.promise;
+    if (cancel === 'stop') await f.command('stop');
+    else if (cancel === 'comparison') {
+      await f.command('configure', '--expected', 'changed-comparison');
+      await handleHook(backgroundEvent(f), f.directory);
+      next = (await readState(f.directory, f.session)).pending;
+    } else await handleHook(backgroundEvent(f, { hook_event_name: cancel }), f.directory);
+  } finally { finish.resolve(); output = await worker; }
+  assert.deepEqual(output, {});
+  const state = await readState(f.directory, f.session);
+  assert.equal(state.samples.length, 0); assert.equal(state.alerts.length, 0); assert.equal(state.missed, 1);
+  assert.equal(state.probeRun, null); assert.equal(state.forkSnapshot, null); assert.equal(state.taskHalt, null);
+  if (next) assert.deepEqual(state.pending, next);
+  if (cancel === 'Interrupt' || cancel === 'SessionEnd') {
+    await handleBackgroundHook(backgroundEvent(f), f.directory, {}, f.dependencies);
+    assert.equal(f.counts().createdBase, 1, 'late tool completion cannot restart a cancelled runtime');
+  }
+});
+
+test('background failures report a gap, never a mismatch or a foreground probe fallback', async (t) => {
+  const f = await fixture(t); await f.command('start');
+  const output = await handleBackgroundHook(managementEvent(f, 'start'), f.directory, {}, {
+    ...f.dependencies, generate: async () => { throw Error('fixture transport failure'); },
+  });
+  assert.ok(output.systemMessage); assert.ok(output.hookSpecificOutput.additionalContext.includes('monitoring gap'));
+  const state = await readState(f.directory, f.session);
+  assert.equal(state.samples.length, 0); assert.equal(state.missed, 1); assert.equal(state.taskHalt, null);
+});
+
+test('probe processes, subagents and other tasks cannot start background inference or update the parent state', async (t) => {
+  const f = await fixture(t); await f.command('start');
+  const original = await readState(f.directory, f.session);
+  for (const [event, env] of [[backgroundEvent(f), { MODELTRACE_PROBE_PROCESS: '1' }], [backgroundEvent(f, { agent_id: 'child' }), {}], [backgroundEvent(f, { parent_session_id: 'other' }), {}], [backgroundEvent(f), { CODEX_THREAD_ID: 'other' }]]) {
+    assert.deepEqual(await handleBackgroundHook(event, f.directory, env, f.dependencies), {});
+  }
+  assert.deepEqual(await readState(f.directory, f.session), original); assert.equal(f.counts().createdBase, 0);
+});
+
+test('runtime readiness requires loaded trusted native async hooks and a synchronous work guard from one source', async () => {
+  const config = JSON.parse(await readFile(path.join(ROOT, 'hooks/hooks.json'), 'utf8'));
+  const hooks = Object.entries(config.hooks).map(([name, groups]) => ({
+    eventName: name[0].toLowerCase() + name.slice(1), ...groups[0].hooks[0], async: groups[0].hooks[0].async || false,
+    enabled: true, trustStatus: 'trusted', pluginId: 'modeltrace-guard@fixture', handlerType: 'command', sourcePath: path.join(ROOT, 'hooks/hooks.json'),
+  }));
+  const client = (items) => ({ request: async () => ({ data: [{ hooks: items }] }) });
+  await requireTrustedGuard(client(hooks), ROOT);
+  for (const change of ['sync-probe', 'async-guard', 'untrusted', 'missing']) {
+    const broken = structuredClone(hooks);
+    if (change === 'sync-probe') broken.find((h) => h.eventName === 'postToolUse').async = false;
+    if (change === 'async-guard') broken.find((h) => h.eventName === 'preToolUse').async = true;
+    if (change === 'untrusted') broken.find((h) => h.eventName === 'userPromptSubmit').trustStatus = 'modified';
+    if (change === 'missing') broken.splice(broken.findIndex((h) => h.eventName === 'sessionStart'), 1);
+    await assert.rejects(() => requireTrustedGuard(client(broken), ROOT), /native async/);
+  }
+});
+
+test('a cancelled or expired background probe never starts an inference turn', async () => {
+  let requests = 0;
+  const client = { request: async () => { requests++; throw Error('must not call'); } };
+  await assert.rejects(() => generateProbe(client, 'fork', { expiresAt: Date.now() - 1 }), /expired before inference/);
+  await assert.rejects(() => generateProbe(client, 'fork', { expiresAt: Date.now() + 10000 }, async () => true), /cancelled/);
+  assert.equal(requests, 0);
+});
+
+test('bounded confirmation wait notices expiry without scoring a missing retry', async (t) => {
+  const f = await fixture(t); await f.command('start');
+  await handleBackgroundHook(managementEvent(f, 'start'), f.directory, {}, f.dependencies);
+  const before = await readState(f.directory, f.session);
+  await f.command('acknowledge', '--alert', before.alerts[0].id);
+  await withState(f.directory, f.session, (state) => { state.pending.expiresAt = Date.now() + 50; });
+  const result = await waitForConfirmation(f.directory, f.session, before.confirmation.id, { timeoutMs: 2000, pollMs: 10 });
+  assert.equal(result.waiting, false); assert.equal(result.agentAction, 'report_coverage_gap');
+  assert.equal(result.confirmation.status, 'interrupted'); assert.equal(result.confirmation.results.length, 0);
+  assert.equal(result.taskHalt, null); assert.equal(result.missedProbes, 1); assert.equal(f.generatedHistories.length, 1);
+  await assert.rejects(() => waitForConfirmation(f.directory, f.session, 'wrong-id'), /No matching/);
+  await assert.rejects(() => f.command('wait'), /requires --confirmation/);
+});
+
+test('cleanup never deletes a base owned by a live retry after the first background hook has exited', async (t) => {
+  const f = await fixture(t); await f.command('start');
+  await handleBackgroundHook(managementEvent(f, 'start'), f.directory, {}, f.dependencies);
+  const state = await readState(f.directory, f.session);
+  // An impossible-to-resolve PID is not assumed dead by production code; use a
+  // confirmed absent synthetic PID so this exercises the cross-worker branch.
+  let deadPid = 999999;
+  while (deadPid > 990000 && processAlive(deadPid)) deadPid--;
+  assert.equal(processAlive(deadPid), false);
+  const filename = cleanupPath(f.directory, state.forkSnapshot.id);
+  const job = JSON.parse(await readFile(filename, 'utf8'));
+  job.ownerPid = deadPid;
+  await writeFile(filename, JSON.stringify(job));
+  await withState(f.directory, f.session, (s) => {
+    s.confirmation.startedAt = 1;
+    s.probeRun = { pid: process.pid, challenge: 'owned-retry' };
+  });
+  // An invalid executable makes an accidental cleanup connection fail the test.
+  assert.deepEqual(await cleanupPending(f.directory, { MODELTRACE_CODEX_PATH: path.join(f.directory, 'must-not-execute') }), []);
+  assert.equal(JSON.parse(await readFile(filename, 'utf8')).status, 'active');
 });

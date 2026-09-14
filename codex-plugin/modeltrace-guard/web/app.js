@@ -11,7 +11,7 @@ const outcomes = {
   compatible: ['本次相符', 'good'], inconclusive: ['证据不足', 'warning'], unknown_expected_model: ['预期标签未收录', 'warning'], missing_expected_model: ['未获取预期模型', 'warning'],
   difference_signal: ['单次强差异', 'bad'], repeated_difference: ['重复差异', 'bad'], candidate_mismatch: ['弱候选不一致', 'warning'],
   not_started: ['尚未开启', 'neutral'], disabled: ['已停止监测', 'neutral'], coverage_gap: ['覆盖缺口', 'warning'], hooks_unverified: ['Hooks 尚未验证', 'warning'],
-  awaiting_sample: ['等待探针提交', 'neutral'], insufficient_evidence: ['等待更多证据', 'neutral'],
+  awaiting_sample: ['后台检测待完成', 'neutral'], insufficient_evidence: ['等待更多证据', 'neutral'],
   task_halted: ['已要求停止任务', 'bad'], confirming_mismatch: ['异常复测中', 'warning'], confirmed_mismatch: ['复测全部不一致', 'bad'],
   waiting_for_work_tool: ['等待工作活动', 'neutral'],
 };
@@ -47,7 +47,7 @@ function renderConfirmation(state) {
     note = `首次异常后的 ${halt.retryCount} 次复测全部与预期模型 ${halt.expected} 不一致。已要求智能体立刻停止原任务、告知用户并等待后续决定。确认提醒、修改设置或停止监测不会解除此停止指令。`;
   } else if (batch.status === 'active') {
     label = `复测 ${done} / ${batch.target}`;
-    const next = state.pendingNotifications ? '等待智能体告知用户并确认提醒' : state.pending ? '等待本次复测提交' : '等待下一次复测';
+    const next = state.pendingNotifications ? '等待智能体告知用户并确认提醒' : state.pending ? '后台复测进行中' : '等待下一次后台复测';
     note = `首次异常已记录；已完成 ${done} / ${batch.target} 次复测，其中 ${mismatches} 次不一致。${next}。本组使用${languageNames[batch.language] || batch.language}，当前次数设置 ${state.frequency.retryCount} 仅影响下一组。`;
   } else if (batch.status === 'completed') {
     label = '复测完成'; color = batch.allMismatch ? 'bad' : 'neutral';
@@ -76,7 +76,7 @@ function renderAlerts(state) {
 }
 function renderTrace(state) {
   const points = [...state.samples.map((sample) => ({ ...sample, kind: 'sample' })), ...state.events.filter((event) => event.type === 'probe_missed').map((event) => ({ ...event, kind: 'gap' }))].sort((a, b) => a.at - b.at).slice(-80);
-  if (!points.length) { $('trace').replaceChildren(element('div', 'trace-empty', '尚无已完成检查点，等待当前任务提交探针')); txt('trace-range', '暂无已完成检查点'); return; }
+  if (!points.length) { $('trace').replaceChildren(element('div', 'trace-empty', '尚无已完成检查点，等待后台检测结果')); txt('trace-range', '暂无已完成检查点'); return; }
   $('trace').replaceChildren(...points.map((point) => {
     const kind = point.kind === 'gap' ? 'gap' : point.outcome === 'compatible' ? 'compatible' : ['difference_signal', 'repeated_difference'].includes(point.outcome) ? 'difference' : 'uncertain';
     const node = element('button', `trace-point ${kind}`); node.type = 'button';
@@ -123,10 +123,10 @@ function render(state) {
   txt('task-meta', `任务 ID：${state.session} · 开始时间：${date(state.startedAt || state.createdAt)}${state.workspaceName ? ` · 工作目录：${state.workspaceName}` : ''}`);
   txt('expected', state.expectedModel || '尚未获取'); txt('expected-note', !state.expectedModel ? '尚未取得声明标签，暂时无法比较是否一致' : state.expectedSource === 'explicit' ? `用户指定 · 声明 ${state.reportedModel || '尚未获取'}` : '跟随 Codex 声明标签 · 非后端认证');
   txt('accepted', state.probesAccepted); txt('issued', `/ ${state.probesIssued} 已发出`);
-  txt('sample-note', `冻结快照 fork · ${state.pending ? '1 个待完成' : '无在途探针'}`);
+  txt('sample-note', `后台快照 fork · ${state.background?.running ? '正在检测' : state.pending ? '已排队' : '无在途探针'}`);
   txt('mismatches', state.mismatchAlerts); txt('alert-note', `${state.differenceSignals} 次强差异 · ${state.pendingNotifications} 条待告知`);
   txt('missed', state.missedProbes + (state.pendingExpired ? 1 : 0));
-  txt('hook-note', state.hookObserved ? `最近工作 hook ${time(state.lastWorkHookAt)}` : state.hookState === 'idle' ? `暂无新工作工具 · 最近 ${date(state.lastWorkHookAt)}` : '等待当前运行中的工作工具验证 hooks');
+  txt('hook-note', state.hookObserved ? `最近工作 hook ${time(state.lastWorkHookAt)}` : state.hookState === 'idle' ? `暂无新工作工具 · 最近 ${date(state.lastWorkHookAt)}` : state.hookState === 'awaiting_background_hook' ? '已观察到工作工具，等待后台 hook 验证' : '等待当前运行中的工作工具验证 hooks');
   renderConfirmation(state); renderTrace(state); renderAlerts(state); renderHistory(state);
   txt('fork-note', `${state.snapshot ? `冻结快照 ${state.snapshot.sha256?.slice(0, 12) || '等待确认'}…` : '当前无保留中的基准快照'}${state.forkCleanup ? ` · 最近清理：${({ pending: '待删除', deleted: '已删除', blocked: '需检查' })[state.forkCleanup.status] || state.forkCleanup.status}` : ''}${state.forkCleanup?.error ? ` · ${state.forkCleanup.error}` : ''}`);
   const latest = state.samples.at(-1); $('weights').replaceChildren();

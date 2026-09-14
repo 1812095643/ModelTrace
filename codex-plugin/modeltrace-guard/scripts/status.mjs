@@ -1,4 +1,4 @@
-import { WARNING, currentOutcome, displayOutcome, publicSample, sessionPath, validateConfig } from './state.mjs';
+import { WARNING, currentOutcome, displayOutcome, processAlive, publicSample, sessionPath, validateConfig } from './state.mjs';
 import { pendingAlerts } from './alerts.mjs';
 import { historyCount } from './history.mjs';
 import { publicSnapshot } from './fork-snapshot.mjs';
@@ -8,8 +8,11 @@ export function summarize(state, directory, now = Date.now()) {
   const pendingExpired = state.pending && now >= state.pending.expiresAt;
   const boundary = Math.max(state.runtimeStartedAt || 0, state.enabledAt || state.startedAt || state.createdAt);
   const workHookAge = state.lastWorkHookAt ? now - state.lastWorkHookAt : null;
-  const hookObserved = !state.runtimeEndedAt && state.lastWorkHookAt >= boundary && workHookAge !== null && workHookAge < 10 * 60 * 1000;
-  const hookState = state.runtimeEndedAt ? 'session_ended' : state.lastWorkHookAt >= boundary && workHookAge !== null ? (hookObserved ? 'recent_work_observed' : 'idle') : 'awaiting_work_tool';
+  const workHookObserved = !state.runtimeEndedAt && state.lastWorkHookAt >= boundary && workHookAge !== null && workHookAge < 10 * 60 * 1000;
+  const backgroundObserved = Boolean(!state.runtimeEndedAt && state.lastBackgroundHookAt && state.lastBackgroundHookAt >= boundary);
+  const hookObserved = workHookObserved && backgroundObserved;
+  const hookState = state.runtimeEndedAt ? 'session_ended' : state.lastWorkHookAt >= boundary && workHookAge !== null
+    ? (workHookObserved ? (backgroundObserved ? 'recent_work_observed' : 'awaiting_background_hook') : 'idle') : 'awaiting_work_tool';
   const latestSample = state.samples.at(-1);
   const outcome = currentOutcome(state);
   const fingerprintDisplayStatus = latestSample?.outcome === outcome ? displayOutcome(latestSample) : outcome;
@@ -24,6 +27,10 @@ export function summarize(state, directory, now = Date.now()) {
     epoch: state.epoch, frequency: validateConfig({}, state.config), hookObserved, hookState,
     runtimeStartedAt: state.runtimeStartedAt || null, lastWorkHookAt: state.lastWorkHookAt || null,
     samplingMode: state.samplingMode || 'legacy_in_context', snapshot: publicSnapshot(state.forkSnapshot), forkHealth: state.forkHealth || null,
+    executionMode: 'async_hooks', lastBackgroundHookAt: state.lastBackgroundHookAt || null,
+    background: { observed: backgroundObserved,
+      running: Boolean(state.probeRun && processAlive(state.probeRun.pid)), challenge: state.probeRun?.challenge || null,
+      startedAt: state.probeRun?.startedAt || null },
     forkCleanup: state.forkCleanup || null,
     confirmation: state.confirmation || null, taskHalt: state.taskHalt || null,
     lastHookAt: state.lastHookAt, probesIssued: state.issued, probesAccepted: historyCount(state, 'samples'),

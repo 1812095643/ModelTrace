@@ -12,6 +12,7 @@ import { DEFAULTS, digest, readState, sessionPath, withState } from '../scripts/
 import { createDashboard, SERVICE } from '../scripts/dashboard-server.mjs';
 import { launchDashboard, stopDashboard } from '../scripts/dashboard.mjs';
 import { queueAlert } from '../scripts/alerts.mjs';
+import { loadArtifacts } from '../scripts/guard.mjs';
 
 const session = 'dashboard-synthetic-fixture';
 async function fixture(t) {
@@ -69,8 +70,10 @@ test('foreign Origin, DNS-rebinding Host and cross-site requests cannot reach da
 test('dashboard reports verified provenance and reuses the original ModelTrace theme', async (t) => {
   const dir = await fixture(t), s = await serverFixture(t, dir);
   const metadata = await (await s.call('/api/info')).json();
-  assert.equal(metadata.assetsVerified, true); assert.equal(metadata.modelCount, 33);
-  assert.ok(metadata.models.some((m) => m.id === 'o4-mini' && m.family === 'gpt'));
+  const { bank, metadata: provenance } = await loadArtifacts();
+  assert.equal(metadata.assetsVerified, true); assert.equal(metadata.modelCount, bank.models.length);
+  assert.equal(metadata.modelCount, provenance.modelCount);
+  assert.deepEqual(metadata.models, bank.models.map(({ id, family }) => ({ id, family })));
   const css = await (await s.call('/modeltrace.css')).text();
   assert.equal(digest(css), metadata.sharedStylesSha256);
   const repoRoot = fileURLToPath(new URL('../../../', import.meta.url));

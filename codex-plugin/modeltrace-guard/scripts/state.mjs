@@ -36,9 +36,10 @@ export function newState(session, now = Date.now()) {
     epoch: 0, model: null, expected: null, expectedSource: 'auto', turn: null,
     issued: 0, turnIssued: 0, workTools: 0, lastHookAt: null, hooksSeen: 0,
     lastSampleAt: null, maxObservedGapSeconds: 0, missed: 0, pending: null,
-    seenTools: [], stopTurn: null, forceProbe: false, samples: [], events: [], alerts: [],
+    seenTools: [], retiredTurns: [], stopTurn: null, forceProbe: false, samples: [], events: [], alerts: [],
     nextTools: null, nextAt: null, lastOutcome: 'not_started', confirmation: null, taskHalt: null,
     samplingMode: 'fork', forkSnapshot: null, probeRun: null, runtimeStartedAt: null, lastWorkHookAt: null, runtimeEndedAt: null,
+    runtimePaused: false, lastBackgroundHookAt: null,
   };
 }
 
@@ -138,11 +139,16 @@ export function updateConfirmation(state, sample, checkpoint, now) {
 
 export function setTurn(state, turn) {
   if (turn && state.turn !== turn) {
+    // Background hook processes can reach the state lock out of order. A late
+    // completion from a known older turn must not roll model metadata backward.
+    if (state.retiredTurns?.includes(turn)) return false;
     const firstBinding = state.turn === null;
+    if (!firstBinding) state.retiredTurns = [...(state.retiredTurns || []).slice(-63), state.turn];
     state.turn = turn;
     if (!firstBinding) state.turnIssued = 0;
     state.stopTurn = null;
   }
+  return true;
 }
 
 export function abandon(state, now, reason) {
@@ -179,7 +185,7 @@ export function expirePending(state, now) {
 
 export function issue(state, now, draw = randomInt) {
   const batch = state.confirmation?.status === 'active' ? state.confirmation : null;
-  if (!state.enabled || state.taskHalt || state.pending || (!batch && !isDue(state, now))) return null;
+  if (!state.enabled || state.taskHalt || state.compacting || state.runtimeEndedAt || state.runtimePaused || state.pending || (!batch && !isDue(state, now))) return null;
   // The agent must notify the user and acknowledge the alert before a retry is
   // issued. Retries are bounded by their batch target, not per-turn/task limits.
   if (batch && (state.alerts || []).some((alert) => !alert.acknowledgedAt)) return null;

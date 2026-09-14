@@ -36,13 +36,17 @@ test('halt blocks work tools including misleading command substrings, preserving
   assert.deepEqual(await handleHook({ session_id: session, hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: cmd } }, dir), {});
 });
 
-test('runtime resume resets historical health and a fresh work completion verifies the new run', async (t) => {
+test('runtime health requires fresh work and background hooks, not an older installation heartbeat', async (t) => {
   const dir = await fixture(t), session = 'resume-fixture';
-  await withState(dir, session, (s) => { s.enabled = true; s.startedAt = 1000; s.lastHookAt = s.lastWorkHookAt = 1500; });
+  await withState(dir, session, (s) => { s.enabled = true; s.startedAt = 1000; s.lastHookAt = s.lastWorkHookAt = s.lastBackgroundHookAt = 1500; });
   await handleHook({ session_id: session, hook_event_name: 'SessionStart', source: 'resume' }, dir, 2000);
   let state = await readState(dir, session);
   assert.equal(summarize(state, dir, 2001).hookObserved, false); assert.ok(state.pending);
   await handleHook({ session_id: session, hook_event_name: 'PostToolUse', tool_use_id: 'real-tool' }, dir, 2100);
+  state = await readState(dir, session);
+  assert.equal(summarize(state, dir, 2200).hookObserved, false);
+  assert.equal(summarize(state, dir, 2200).hookState, 'awaiting_background_hook');
+  await withState(dir, session, (s) => { s.lastBackgroundHookAt = 2100; });
   state = await readState(dir, session);
   assert.equal(summarize(state, dir, 2200).hookObserved, true);
   assert.equal(summarize(state, dir, 999999).hookState, 'idle');

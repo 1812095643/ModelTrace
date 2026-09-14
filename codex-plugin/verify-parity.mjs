@@ -9,7 +9,9 @@ import { loadArtifacts } from './modeltrace-guard/scripts/guard.mjs';
 const repo = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const rows = (await readFile(path.join(repo, 'data', 'gpt_reference.jsonl'), 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
 const { bank, analyzeGlobalOutputs } = await loadArtifacts();
-const cases = ['gpt-5.4', 'gpt-6-astra', 'gpt-5.3-codex', 'o1', 'o3', 'o3-mini', 'o4-mini'].flatMap((model) => {
+const models = bank.models.filter((model) => model.family === 'gpt').map((model) => model.id);
+assert.ok(models.length > 0, 'Packaged bank has no GPT models');
+const cases = models.flatMap((model) => {
   const selected = rows.filter((row) => row.model_id === model && row.strict_valid).slice(0, 3);
   assert.equal(selected.length, 3, `Missing saved references for ${model}`);
   return [1, 3].map((k) => ({ model, outputs: selected.slice(0, k).map((row) => ({ text: row.text, expected_count: row.requested_count })) }));
