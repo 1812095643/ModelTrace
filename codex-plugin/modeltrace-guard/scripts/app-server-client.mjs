@@ -91,7 +91,7 @@ export async function openAppServer(env = process.env) {
   });
   const client = new AppServerClient(child);
   try {
-    await client.request('initialize', { clientInfo: { name: 'modeltrace_guard', version: '0.1.0' }, capabilities: { experimentalApi: true } });
+    await client.request('initialize', { clientInfo: { name: 'modeltrace_guard', version: '0.1.1' }, capabilities: { experimentalApi: true } });
     client.write({ method: 'initialized' });
     return client;
   } catch (error) { await client.close(); throw error; }
