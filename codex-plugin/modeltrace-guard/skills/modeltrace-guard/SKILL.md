@@ -9,14 +9,14 @@ Use `../../scripts/guard.mjs` relative to this skill directory; resolve its abso
 
 ## Enable and configure
 
-Only enable monitoring when the user asks for this task. Installation alone does not enable it. Use the real `CODEX_THREAD_ID`, or a trusted hook's actual session ID if unavailable; never invent a task ID. Preserve a user-defined task name. A verified app task title or user-provided name may be passed to `start --name`; otherwise use the workspace/time fallback. Do not derive a model identity from the classifier's prediction.
+Only enable monitoring when the user asks for this task. Installation alone does not enable it. Use the real `CODEX_THREAD_ID`, or a trusted hook's actual session ID if unavailable; never invent a task ID. Preserve a user-defined task name. When a verified app task title is available, pass it to `start --name`; never use the shared workspace name as a task title. The background snapshot also captures the native task title without reading transcript contents. Do not derive a model identity from the classifier's prediction.
 
 Run `node <guard> doctor` to verify bundled files. `doctor --fork true` additionally creates native snapshot/ephemeral forks without inference, checks runtime settings, trusted synchronous tool blocking and native async background hooks, then queues deletion of its temporary base. Read the returned readiness and cleanup status honestly. If runtime selection is ambiguous, the user may set `MODELTRACE_CODEX_PATH` to the absolute executable used by their Codex app. Never fix this by changing an unrelated provider/account or bypassing hook trust.
 
 Run `start` with only the requested overrides:
 
 - `--expected <exact-label>` sets the comparison label; `--expected auto` follows Codex metadata. `models` lists bank labels. Missing metadata and a nonempty unlisted model are different outcomes; neither is a mismatch.
-- `--tool-min 8 --tool-max 16` sets a random interval of observed work-tool completions. Equal values fix the interval. No elapsed-time scheduling or turn/task count caps.
+- `--tool-min 16 --tool-max 32` sets a random interval of observed work-tool completions (the default). Equal values fix the interval. Existing tasks retain their saved intervals until configured. No elapsed-time scheduling or turn/task count caps.
 - `--retry-count 3` sets additional tests after an initial mismatch; default 3, allowed 1–100. A request such as “复测改成 5 次” maps to `configure --retry-count 5`.
 - `--pending-seconds 180` is the issuance-to-completion deadline, not sampling frequency. Changes apply only to newly issued checkpoints.
 - `--languages zh,en,ja,ko,fr,de,es,pt,ru,ar` selects the random language pool. Default `zh,en`; one language fixes it.

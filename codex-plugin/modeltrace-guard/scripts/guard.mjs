@@ -395,6 +395,13 @@ export async function run(args, env = process.env, receipt = null) {
     if (command === 'start') state.runtimePaused = false;
     if (options.name !== undefined) setTaskName(state, options.name, now);
     state.workspaceName ||= workspaceName(process.cwd());
+    // Hooks may have created a disabled record before the plugin was updated.
+    // Its old default is not a user-selected interval. Actual prior monitoring
+    // keeps its saved configuration, including an explicit 8–16 interval.
+    if (command === 'start' && !state.enabled && !state.enabledAt && !state.startedAt && !state.issued && !state.samples.length
+      && state.config.toolMin === 8 && state.config.toolMax === 16) {
+      state.config = { ...state.config, toolMin: DEFAULTS.toolMin, toolMax: DEFAULTS.toolMax };
+    }
     state.config = validateConfig(patch, state.config);
     const newExpected = options.expected;
     let changedExpected = false;

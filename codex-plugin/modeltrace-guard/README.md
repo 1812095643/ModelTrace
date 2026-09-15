@@ -35,7 +35,7 @@ codex plugin add modeltrace-guard@modeltrace
 
 对目标任务说：
 
-> 使用 $modeltrace-guard 为本任务开启监测，每隔 8–16 次工作工具调用检测，异常后复测 3 次，使用中文和英语。
+> 使用 $modeltrace-guard 为本任务开启监测，每隔 16–32 次工作工具调用检测，异常后复测 3 次，使用中文和英语。
 
 > 把复测次数改成 5 次。
 
@@ -46,7 +46,7 @@ codex plugin add modeltrace-guard@modeltrace
 ```powershell
 node scripts/guard.mjs doctor
 node scripts/guard.mjs doctor --fork true
-node scripts/guard.mjs start --tool-min 8 --tool-max 16 --retry-count 3 --languages zh,en
+node scripts/guard.mjs start --tool-min 16 --tool-max 32 --retry-count 3 --languages zh,en
 node scripts/guard.mjs configure --retry-count 5
 node scripts/guard.mjs status
 node scripts/guard.mjs dashboard
@@ -59,12 +59,16 @@ node scripts/guard.mjs stop
 
 | 设置 | 默认与含义 |
 | --- | --- |
-| `--tool-min N --tool-max M` | 8–16 次观察到的工作工具完成；N=M 固定间隔 |
+| `--tool-min N --tool-max M` | 16–32 次观察到的工作工具完成；N=M 固定间隔 |
 | `--retry-count N` | 首次不一致后额外复测，默认 3，允许 1–100 |
 | `--pending-seconds N` | 从发出探针到完成评分的时限，默认 180 秒，不是检测间隔 |
 | `--languages zh,en,...` | 默认中英；支持 zh/en/ja/ko/fr/de/es/pt/ru/ar，单项固定语言 |
 
 没有每轮或任务累计探针数量上限。普通检查按工具间隔进行，空闲不启动新采样，已开始的后台检查可在本轮回答结束后完成。同一任务最多一个在途探针；多个工具同时完成不会重复发起。修改设置不清空历史；当前复测组保持创建时的配置。
+
+升级保留已有任务保存的间隔。要调整已开启任务，可在仪表盘保存 16–32，或对该任务说“把探测间隔改成 16–32 次工具调用”。
+
+仪表盘按任务区分监测状态，不按工作目录合并。首次后台快照会从 Codex 任务元数据读取真实标题，用户自定义名称优先；标题暂不可用时显示“未命名任务（工作目录）”及时间。列表同时保留已停止任务的历史记录，并标明开关状态。打开页面或选择任务不会开启探测。
 
 ## 后台运行
 
@@ -83,7 +87,11 @@ node scripts/guard.mjs stop
 
 每次复测都读取首次检测使用的快照，不继承其他探针的数字，也不包含告警后主任务增加的内容。原任务的已有消息保持不变。
 
-快照按 Codex 原生 fork 机制继承已保存的上下文及其压缩结果；插件不会将历史消息全文重新拼入探针提示词。快照校验仅读取轮次元数据，`sha256Scope: turn_boundaries_v1` 表示校验值对应轮次边界，不是消息全文。尚未落盘的内容不在快照中；运行中的轮次可能带有 Codex 的中断标记。缓存命中还取决于客户端工具、配置、路由和缓存策略。样本详情中的 `fork.usage.cachedInputTokens` 展示 Codex 返回的缓存输入计数，`null` 表示未提供计数。
+快照按 Codex 原生 fork 机制继承已保存的上下文及其压缩结果；插件不会将历史消息全文重新拼入探针提示词。快照校验仅读取轮次元数据，`sha256Scope: turn_boundaries_v1` 表示校验值对应轮次边界，不是消息全文。尚未落盘的内容不在快照中；运行中的轮次可能带有 Codex 的中断标记。
+
+使用 ChatGPT 登录及默认 Codex 服务时，探针沿用原任务的缓存会话，临时任务和轮次 ID 保持独立。插件只在该探针的本机连接上调整缓存会话请求头；上下文、压缩后的请求正文、工具定义、模型和思考程度均保持不变，连接在检测完成或取消后关闭。样本的 `fork.cacheScope: source_session` 表示已沿用原任务的缓存会话，`fork.usage.cachedInputTokens` 是 Codex 返回的实际缓存计数，`null` 表示未提供计数。
+
+API Key 登录、自定义服务地址、代理和自定义 CA 配置继续使用 Codex 原生连接，对应 `fork.cacheScope: native_fork`。缓存过期、上下文压缩或前缀配置变化后，首次请求仍可能需要重新建立缓存。
 
 模型、厂商、推理强度与工作目录直接读取 Codex 的任务元数据，不扫描本地历史文件。接口缺少所需配置时报告检测未能启动，不回退到读取历史或使用全局默认模型。
 

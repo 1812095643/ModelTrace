@@ -60,6 +60,20 @@ async function fixture(t) {
   return { directory, session, model, threads, calls, initialHistory, generatedHistories, dependencies, connect, command, counts: () => ({ createdBase, closed }) };
 }
 
+test('snapshot captures the native title using the existing summary read and preserves a custom name', async (t) => {
+  const f = await fixture(t);
+  f.threads.get(f.session).name = '为当前任务开启 ModelTrace Guard';
+  const pending = (await f.command('start', '--name', '自定义监测名称')).pending;
+  const result = await runForkProbe(f.directory, f.session, pending.id, {}, f.dependencies);
+  assert.equal(result.accepted, true, result.reason);
+  const state = await readState(f.directory, f.session);
+  assert.equal(state.codexTaskName, '为当前任务开启 ModelTrace Guard');
+  assert.equal(summarize(state, f.directory).displayName, '自定义监测名称');
+  assert.equal(state.enabled, true); assert.equal(state.issued, 1);
+  const reads = f.calls.filter((call) => call.method === 'thread/read' && call.params.threadId === f.session);
+  assert.deepEqual(reads.map((call) => call.params), [{ threadId: f.session, includeTurns: false }]);
+});
+
 test('initial probe and all three retries fork one immutable native base, never prior probe answers', async (t) => {
   const f = await fixture(t);
   let pending = (await f.command('start', '--languages', 'en')).pending, base;

@@ -2,18 +2,22 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openAppServer } from './app-server-client.mjs';
+import { prepareCacheTransport } from './cache-transport.mjs';
 import { freezeSnapshot, publicSnapshot, removeSnapshot, verifySnapshot } from './fork-snapshot.mjs';
 import { forkPrompt } from './prompts.mjs';
-import { BACKGROUND_STATE_LOCK, abandon, digest, interruptConfirmation, processAlive, readState, record, schedule, withState } from './state.mjs';
+import { BACKGROUND_STATE_LOCK, abandon, digest, interruptConfirmation, processAlive, readState, record, schedule, setCodexTaskName, withState } from './state.mjs';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-export function forkParameters(snapshot) {
+export function forkParameters(snapshot, cacheTransport = null) {
   return {
     // Native ephemeral forks reject deferGoalContinuation. The transport only
     // permits the one turn explicitly requested for this disposable fork.
     threadId: snapshot.id, lastTurnId: snapshot.sourceTurn, ephemeral: true, excludeTurns: true,
     model: snapshot.model, modelProvider: snapshot.provider, cwd: snapshot.cwd,
-    ...(snapshot.effort ? { config: { model_reasoning_effort: snapshot.effort } } : {}),
+    ...(snapshot.effort || cacheTransport ? { config: {
+      ...(snapshot.effort ? { model_reasoning_effort: snapshot.effort } : {}),
+      ...(cacheTransport ? { openai_base_url: cacheTransport.url } : {}),
+    } } : {}),
   };
 }
 
@@ -28,9 +32,10 @@ export function verifyFork(response, snapshot) {
   };
 }
 
-export async function prepareProbeFork(client, snapshot) {
-  const response = await client.request('thread/fork', forkParameters(snapshot), 30000);
+export async function prepareProbeFork(client, snapshot, cacheTransport = null) {
+  const response = await client.request('thread/fork', forkParameters(snapshot, cacheTransport), 30000);
   const effective = verifyFork(response, snapshot);
+  cacheTransport?.authorize(response.thread.id);
   return { response, effective };
 }
 
@@ -126,7 +131,7 @@ export async function runForkProbe(directory, session, challenge, env = process.
   const generate = dependencies.generate || generateProbe;
   const stateOptions = dependencies.background ? BACKGROUND_STATE_LOCK : undefined;
   const updateState = (callback) => withState(directory, session, callback, stateOptions);
-  let client, snapshot, pending, receipt, text, cleanupConfirmed = false;
+  let client, cacheTransport, snapshot, pending, receipt, text, cleanupConfirmed = false;
   const claimed = await updateState((state) => {
     // Parallel background hooks race for one atomic checkpoint lease. A losing
     // contender must not report an error or cancel the winning worker's batch.
@@ -149,12 +154,14 @@ export async function runForkProbe(directory, session, challenge, env = process.
         if (!state.enabled || state.pending?.id !== challenge || state.pending.epoch !== pending.epoch) throw new Error('Checkpoint changed before snapshot capture');
         if (state.model && state.model !== snapshot.model) throw new Error('Source task model metadata differs from the active hook model; wait for task metadata to synchronize');
         if (!state.model) { state.model = snapshot.model; if (state.expectedSource === 'auto') state.expected = state.model; }
+        setCodexTaskName(state, snapshot.sourceTaskName);
         state.forkSnapshot = snapshot;
         record(state, 'fork_snapshot_frozen', Date.now(), publicSnapshot(snapshot));
       });
     }
     await verifySnapshot(client, snapshot);
-    const { response: fork, effective } = await prepareProbeFork(client, snapshot);
+    cacheTransport = await prepareCacheTransport(client, snapshot, env);
+    const { response: fork, effective } = await prepareProbeFork(client, snapshot, cacheTransport);
     await enforceTrust(client, snapshot.cwd);
     await updateState((state) => {
       if (!state.enabled || state.pending?.id !== challenge) throw new Error('Checkpoint cancelled');
@@ -168,9 +175,10 @@ export async function runForkProbe(directory, session, challenge, env = process.
       return !state?.enabled || state.taskHalt || state.pending?.id !== challenge || state.epoch !== pending.epoch;
     });
     text = generated.text;
-    await client.close(); cleanupConfirmed = true;
+    await client.close(); await cacheTransport?.close(); cleanupConfirmed = true;
     receipt = { mode: 'ephemeral_fork', snapshot: publicSnapshot(snapshot), effective, cleanedUp: true, usage: generated.usage || null,
-      cacheHit: generated.usage ? generated.usage.cachedInputTokens > 0 : null, routingScope: 'fork_continuation' };
+      cacheHit: generated.usage ? generated.usage.cachedInputTokens > 0 : null, routingScope: 'fork_continuation',
+      cacheScope: cacheTransport?.mode || 'native_fork' };
     const result = await dependencies.submit(directory, session, challenge, text, receipt, stateOptions);
     return result;
   } catch (error) {
@@ -187,6 +195,7 @@ export async function runForkProbe(directory, session, challenge, env = process.
   } finally {
     try { if (client && !cleanupConfirmed) await client.close(); }
     finally {
+      await cacheTransport?.close();
       await updateState(async (state) => {
         if (state.probeRun?.challenge === challenge) state.probeRun = null;
         if (state.confirmation?.status !== 'active' || !state.enabled || state.taskHalt) {

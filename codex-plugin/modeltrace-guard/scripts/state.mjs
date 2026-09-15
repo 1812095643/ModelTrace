@@ -8,7 +8,7 @@ import { compactHistory } from './history.mjs';
 import { removeSnapshot } from './fork-snapshot.mjs';
 
 export const DEFAULTS = Object.freeze({
-  mode: 'tools', toolMin: 8, toolMax: 16, retryCount: 3,
+  mode: 'tools', toolMin: 16, toolMax: 32, retryCount: 3,
   pendingSeconds: 180,
   languages: ['zh', 'en'],
 });
@@ -32,7 +32,7 @@ export function validateConfig(patch = {}, previous = DEFAULTS) {
 
 export function newState(session, now = Date.now()) {
   return {
-    schema: 2, session, enabled: false, createdAt: now, config: { ...DEFAULTS }, taskName: null, workspaceName: null,
+    schema: 2, session, enabled: false, createdAt: now, config: { ...DEFAULTS }, taskName: null, codexTaskName: null, workspaceName: null,
     epoch: 0, model: null, expected: null, expectedSource: 'auto', turn: null,
     issued: 0, turnIssued: 0, workTools: 0, lastHookAt: null, hooksSeen: 0,
     lastSampleAt: null, maxObservedGapSeconds: 0, missed: 0, pending: null,
@@ -53,6 +53,17 @@ export function setTaskName(state, name, now = Date.now()) {
   if (state.taskName !== clean) {
     state.taskName = clean;
     record(state, 'task_name_changed', now, { name: clean });
+  }
+}
+
+// A Codex title is display metadata, never an instruction or monitoring opt-in.
+// Keep it separate from a name the user explicitly chose in this dashboard.
+export function setCodexTaskName(state, name, now = Date.now()) {
+  if (typeof name !== 'string' || !name.trim() || name.trim().length > 120 || /[\x00-\x1f\x7f]/.test(name)) return;
+  const clean = name.trim();
+  if (state.codexTaskName !== clean) {
+    state.codexTaskName = clean;
+    record(state, 'codex_task_name_updated', now, { name: clean });
   }
 }
 

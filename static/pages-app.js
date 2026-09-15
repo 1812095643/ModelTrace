@@ -85,6 +85,10 @@ function renderResult(payload) {
     </div>
     <div class="diagnostics">${diagnostics}</div>
     <div class="table-wrap"><table><thead><tr><th>排序</th><th>候选模型</th><th>家族</th><th>归因概率</th><th>分布相似度</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <div class="result-guidance" role="note" aria-label="结果说明">
+      <p>本工具仅对指纹库内的模型进行归因；若待测模型不在指纹库中，得到任何结果都有可能。</p>
+      <p>Claude Code 的系统提示词会影响模型偏好，测试结果存在较大偏差，建议不要在 Claude Code 中测试。</p>
+    </div>
   `;
   result.hidden = false;
   result.scrollIntoView({ behavior: "smooth", block: "start" });

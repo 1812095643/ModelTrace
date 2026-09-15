@@ -40,7 +40,7 @@ async function fixture() {
       calls.push({ route, options });
       let result;
       if (route === '/api/info') result = { modelCount: 33, bankSha256: 'synthetic-hash' };
-      else if (route === '/api/sessions') result = { sessions: [{ id: state.id, session: state.session, displayName: '合成交互测试', expectedModel: state.expectedModel, enabled: true }], unreadable: 0 };
+      else if (route === '/api/sessions') result = { sessions: [{ id: state.id, session: state.session, displayName: '合成交互测试', expectedModel: state.expectedModel, enabled: state.enabled }], unreadable: 0 };
       else if (route.endsWith('/configure')) result = { ...state, frequency: { ...state.frequency, ...JSON.parse(options.body) } };
       else result = state;
       return { ok: true, json: async () => result };
@@ -114,4 +114,13 @@ test('dashboard distinguishes a queued probe, a live background worker and no pe
   context.render(state); assert.match(nodes['sample-note'].textContent, /正在检测/);
   state.pending = null; state.background.running = false;
   context.render(state); assert.match(nodes['sample-note'].textContent, /无在途探针/);
+});
+
+test('task selector distinguishes enabled monitoring from stopped historical records', async () => {
+  const { context, nodes, state } = await fixture();
+  assert.match(nodes.session.children[0].textContent, /^已开启 · 合成交互测试/);
+  state.enabled = false; state.status = 'disabled';
+  await context.refresh();
+  assert.match(nodes.session.children[0].textContent, /^已停止 · 历史记录 · 合成交互测试/);
+  assert.equal(nodes.runtime.textContent, '已停止监测');
 });

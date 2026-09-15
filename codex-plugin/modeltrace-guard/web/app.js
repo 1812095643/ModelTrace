@@ -15,7 +15,7 @@ const outcomes = {
   task_halted: ['已要求停止任务', 'bad'], confirming_mismatch: ['异常复测中', 'warning'], confirmed_mismatch: ['复测全部不一致', 'bad'],
   waiting_for_work_tool: ['等待工作活动', 'neutral'],
 };
-const eventNames = { probe_issued: '发出探针', probe_missed: '采样缺口', segment_started: '开始新分段', frequency_configured: '更新采样设置', monitoring_stopped: '停止监测', compaction_started: '上下文压缩', interrupted: '任务被中断', session_ended: '任务结束', budget_paused: '采样数量上限暂停', agent_reported_user_notified: '智能体确认已告知', task_name_changed: '更新显示名称', model_label_observed: '获取声明模型', configuration_migrated: '迁移采样设置', confirmation_started: '开始异常复测', confirmation_result: '完成一次复测', confirmation_completed: '复测完成', confirmation_interrupted: '复测中断', task_halt_requested: '要求停止原任务', task_resumed: '按用户要求恢复任务' };
+const eventNames = { probe_issued: '发出探针', probe_missed: '采样缺口', segment_started: '开始新分段', frequency_configured: '更新采样设置', monitoring_stopped: '停止监测', compaction_started: '上下文压缩', interrupted: '任务被中断', session_ended: '任务结束', budget_paused: '采样数量上限暂停', agent_reported_user_notified: '智能体确认已告知', task_name_changed: '更新显示名称', codex_task_name_updated: '同步任务标题', model_label_observed: '获取声明模型', configuration_migrated: '迁移采样设置', confirmation_started: '开始异常复测', confirmation_result: '完成一次复测', confirmation_completed: '复测完成', confirmation_interrupted: '复测中断', task_halt_requested: '要求停止原任务', task_resumed: '按用户要求恢复任务' };
 const reasons = { monitoring_started: '开启监测', reported_model_changed: '声明模型改变', expected_model_changed: '预期模型改变', context_compaction: '上下文压缩', context_cleared: '上下文清空', reference_bank_changed: '参考库改变', expired_or_ignored: '探针过期或未提交', late_submission: '提交超时', monitoring_stopped: '监测停止', user_interrupted: '用户中断', session_ended: '任务结束', stop_continuation_not_completed: '收尾探针未完成', comparison_changed: '复测条件改变', comparison_unavailable: '无法比较预期模型' };
 const date = (at) => at ? new Date(at).toLocaleString('zh-CN', { hour12: false }) : '—';
 const time = (at) => at ? new Date(at).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
@@ -120,7 +120,7 @@ function render(state) {
     txt('runtime', '尚未开启'); $('runtime').className = 'pill neutral'; return;
   }
   const runtime = outcomes[state.status] || [state.status, 'neutral']; txt('runtime', runtime[0]); $('runtime').className = `pill ${runtime[1]}`;
-  txt('task-meta', `任务 ID：${state.session} · 开始时间：${date(state.startedAt || state.createdAt)}${state.workspaceName ? ` · 工作目录：${state.workspaceName}` : ''}`);
+  txt('task-meta', `任务 ID：${state.session} · 最近开启时间：${date(state.enabledAt || state.startedAt || state.createdAt)}${state.workspaceName ? ` · 工作目录：${state.workspaceName}` : ''}`);
   txt('expected', state.expectedModel || '尚未获取'); txt('expected-note', !state.expectedModel ? '尚未取得声明标签，暂时无法比较是否一致' : state.expectedSource === 'explicit' ? `用户指定 · 声明 ${state.reportedModel || '尚未获取'}` : '跟随 Codex 声明标签 · 非后端认证');
   txt('accepted', state.probesAccepted); txt('issued', `/ ${state.probesIssued} 已发出`);
   txt('sample-note', `后台快照 fork · ${state.background?.running ? '正在检测' : state.pending ? '已排队' : '无在途探针'}`);
@@ -169,7 +169,7 @@ async function refresh() {
     if (!selected && result.sessions.length) selected = result.sessions[0].id;
     const signature = JSON.stringify(result.sessions.map((s) => [s.id, s.displayName, s.expectedModel, s.enabled])) + selected;
     if ($('session').dataset.signature !== signature) {
-      const options = result.sessions.map((s) => { const option = element('option', '', `${s.displayName || '监测任务'} · ${s.expectedModel || '模型待获取'}`); option.value = s.id; option.title = `任务 ID：${s.session}`; return option; });
+      const options = result.sessions.map((s) => { const option = element('option', '', `${s.enabled ? '已开启' : '已停止 · 历史记录'} · ${s.displayName || '监测任务'} · ${s.expectedModel || '模型待获取'}`); option.value = s.id; option.title = `任务 ID：${s.session}`; return option; });
       if (!result.sessions.some((s) => s.id === selected)) { const option = element('option', '', selected ? '当前任务尚未开启监测' : '暂无监测任务'); option.value = selected; options.unshift(option); }
       $('session').replaceChildren(...options); $('session').value = selected; $('session').dataset.signature = signature;
     }

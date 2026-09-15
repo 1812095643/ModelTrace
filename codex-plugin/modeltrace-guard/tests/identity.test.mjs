@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
-import { classifySample, digest, displayOutcome, newState, publicSample, readState, schedule, sessionPath, setTaskName, withState, workspaceName } from '../scripts/state.mjs';
+import { classifySample, digest, displayOutcome, newState, publicSample, readState, schedule, sessionPath, setCodexTaskName, setTaskName, withState, workspaceName } from '../scripts/state.mjs';
 import { handleHook, run } from '../scripts/guard.mjs';
+import { handleBackgroundHook } from '../scripts/background.mjs';
 import { summarize } from '../scripts/status.mjs';
 import { createDashboard } from '../scripts/dashboard-server.mjs';
 
@@ -49,14 +50,50 @@ test('late arrival of model metadata updates future expectations, not old sample
   assert.ok(!JSON.stringify(after).includes('C:\\\\work'));
 });
 
-test('readable names fall back to workspace and time, with task IDs kept out of the main label', () => {
+test('unnamed tasks explicitly distinguish workspace fallback from a real task title', () => {
   const s = newState(session, 1000); s.workspaceName = 'ModelTrace';
-  assert.ok(summarize(s, '/test').displayName.startsWith('ModelTrace · '));
+  assert.ok(summarize(s, '/test').displayName.startsWith('未命名任务（ModelTrace） · '));
   assert.ok(!summarize(s, '/test').displayName.includes(session));
   setTaskName(s, '  重构登录流程  ', 1001); assert.equal(summarize(s, '/test').displayName, '重构登录流程');
   setTaskName(s, '重构登录流程', 1002); assert.equal(s.events.length, 1);
   for (const bad of ['', ' ', 'x'.repeat(121), 'a\nb', 3, null]) assert.throws(() => setTaskName(s, bad));
   assert.equal(workspaceName('C:\\work\\project\\'), 'project'); assert.equal(workspaceName('/work/project'), 'project'); assert.equal(workspaceName('bad\npath'), null);
+});
+
+test('native task titles are metadata only and never override a custom name', () => {
+  const s = newState(session, 1000); s.workspaceName = 'traitnew';
+  setCodexTaskName(s, '  开启 ModelTrace Guard  ', 1001);
+  assert.equal(summarize(s, '/test').displayName, '开启 ModelTrace Guard');
+  assert.equal(s.taskName, null); assert.equal(s.enabled, false); assert.equal(s.issued, 0);
+  setTaskName(s, '我的自定义名称', 1002);
+  setCodexTaskName(s, 'Codex 中的新标题', 1003);
+  assert.equal(summarize(s, '/test').displayName, '我的自定义名称');
+  assert.equal(summarize(s, '/test').codexTaskName, 'Codex 中的新标题');
+  const before = JSON.stringify(s);
+  for (const name of ['', ' ', null, 42, 'x'.repeat(121), 'bad\nname']) setCodexTaskName(s, name);
+  assert.equal(JSON.stringify(s), before);
+});
+
+test('same-workspace tasks do not inherit opt-in and dashboard selection cannot start them', async (t) => {
+  const dir = await fixture(t);
+  await run(['start', '--session', session, '--data-dir', dir], {});
+  const parent = await readState(dir, session), other = 'different-task-in-same-workspace';
+  let connects = 0;
+  const dependencies = { connect: async () => { connects++; throw new Error('Unenabled task must never connect'); } };
+  for (const hook_event_name of ['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'PostToolUse']) {
+    assert.deepEqual(await handleBackgroundHook({ session_id: other, hook_event_name, cwd: process.cwd(), model: 'gpt-6-astra', source: 'resume', tool_name: 'exec_command', tool_use_id: hook_event_name }, dir, {}, dependencies), {});
+  }
+  const inactive = await readState(dir, other);
+  assert.equal(inactive.enabled, false); assert.equal(inactive.issued, 0); assert.equal(inactive.samples.length, 0);
+  assert.equal(inactive.pending, null); assert.equal(connects, 0);
+  assert.deepEqual(await readState(dir, session), parent);
+  const service = await createDashboard({ directory: dir }); t.after(() => service.close());
+  const headers = { Authorization: `Bearer ${service.token}` };
+  const listing = await (await fetch(service.origin + '/api/sessions', { headers })).json();
+  assert.deepEqual(listing.sessions.map((s) => s.session), [session]);
+  const viewed = await (await fetch(service.origin + '/api/sessions/' + digest(other), { headers })).json();
+  assert.equal(viewed.enabled, false); assert.equal(viewed.probesIssued, 0);
+  assert.deepEqual(await readState(dir, other), inactive);
 });
 
 test('label CLI can name an inactive task without starting probes or changing counters', async (t) => {

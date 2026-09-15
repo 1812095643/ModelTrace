@@ -24,7 +24,12 @@ export async function sourceSettings(client, session) {
     || typeof thread.cwd !== 'string' || !path.isAbsolute(thread.cwd)) {
     throw new Error('Codex source task metadata lacks model/provider/reasoning/workspace settings; no history scan or default-model fallback');
   }
-  return { model: thread.model, provider: thread.modelProvider, effort: thread.reasoningEffort, cwd: thread.cwd };
+  // Reuse this summary read for the real task title; do not read a transcript
+  // or infer the title from the shared workspace name.
+  const sourceTaskName = typeof thread.name === 'string' && thread.name.trim().length <= 120 && !/[\x00-\x1f\x7f]/.test(thread.name) ? thread.name.trim() : null;
+  return { model: thread.model, provider: thread.modelProvider, effort: thread.reasoningEffort, cwd: thread.cwd,
+    ...(UUID.test(thread.sessionId || '') ? { cacheSessionId: thread.sessionId } : {}),
+    ...(sourceTaskName ? { sourceTaskName } : {}) };
 }
 
 export async function lastTurn(client, id) {

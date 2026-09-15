@@ -43,6 +43,32 @@ test('frequency is tools-only and retry count defaults to 3 with configurable bo
   for (const patch of [{ mode: 'time' }, { mode: 'either' }, { mode: 'both' }, { mode: 'background' }, { toolMin: 0 }, { secondsMin: -1 }, { toolMin: 4, toolMax: 2 }, { secondsMin: 1000, secondsMax: 3 }, { retryCount: 0 }, { retryCount: 101 }, { retryCount: 2.5 }, { retryCount: '3' }, { maxPerTurn: 50, maxPerSession: 40 }, { maxPerSession: 1001 }, { toolMin: NaN }, { toolMax: 2.5 }, { rogue: 1 }, { languages: [] }, { languages: ['xx'] }, { languages: ['en', 'en'] }]) assert.throws(() => validateConfig(patch));
 });
 
+test('new tasks default to 16–32 work tools without overwriting saved custom intervals', async (t) => {
+  assert.equal(DEFAULTS.toolMin, 16); assert.equal(DEFAULTS.toolMax, 32);
+  assert.equal(validateConfig({}).toolMin, 16); assert.equal(validateConfig({}).toolMax, 32);
+  const directory = await fixture(t);
+  const started = await run(['start', ...flags(directory)], {});
+  assert.equal(started.frequency.toolMin, 16); assert.equal(started.frequency.toolMax, 32);
+  assert.equal(started.probesIssued, 1);
+  for (const [toolMin, toolMax] of [[8, 16], [30, 60], [40, 40]]) {
+    await run(['configure', ...flags(directory), '--tool-min', String(toolMin), '--tool-max', String(toolMax)], {});
+    const configured = await run(['configure', ...flags(directory), '--retry-count', '5'], {});
+    assert.equal(configured.frequency.toolMin, toolMin); assert.equal(configured.frequency.toolMax, toolMax);
+    assert.equal(configured.probesIssued, 1, 'configuration does not issue another probe');
+  }
+});
+
+test('never-enabled legacy hook records pick up new defaults but restarted tasks keep saved intervals', async (t) => {
+  const dir = await fixture(t);
+  await withState(dir, session, (state) => { state.config.toolMin = 8; state.config.toolMax = 16; });
+  const first = await run(['start', ...flags(dir)], {});
+  assert.equal(first.frequency.toolMin, 16); assert.equal(first.frequency.toolMax, 32);
+  await run(['configure', ...flags(dir), '--tool-min', '8', '--tool-max', '16'], {});
+  await run(['stop', ...flags(dir)], {});
+  const restarted = await run(['start', ...flags(dir)], {});
+  assert.equal(restarted.frequency.toolMin, 8); assert.equal(restarted.frequency.toolMax, 16);
+});
+
 test('only work-tool thresholds schedule probes; elapsed time cannot make a checkpoint due', () => {
   const state = newState(session, 1000);
   schedule(state, 1000, minimum);
@@ -362,7 +388,7 @@ test('expiry setting controls new submission deadlines, never changes the live c
   await handleHook(event('PostToolUse'), dir);
   const state = await readState(dir, session);
   assert.equal(state.pending.expiresAt - state.pending.at, 600000);
-  assert.equal(state.config.mode, 'tools'); assert.equal(state.config.toolMin, 8); assert.equal(state.config.toolMax, 16);
+  assert.equal(state.config.mode, 'tools'); assert.equal(state.config.toolMin, start.frequency.toolMin); assert.equal(state.config.toolMax, start.frequency.toolMax);
 });
 
 test('expired pending shown as coverage gap even with no further hooks', () => {
