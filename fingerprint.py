@@ -9,13 +9,14 @@ from pathlib import Path
 from typing import Iterable
 
 import numpy as np
+from runtime_paths import DATA_DIR
 
 VALUE_MIN = 1
 VALUE_MAX = 355
 DIMENSION = VALUE_MAX - VALUE_MIN + 1
 ALPHA = 0.5
 ORDERED_BLOCK_WEIGHT = 0.25
-DEFAULT_BANK = Path(__file__).with_name("data") / "gpt_bank.json"
+DEFAULT_BANK = DATA_DIR / "gpt_bank.json"
 FAMILY_DISPLAY_NAMES = {"gpt": "GPT", "claude": "Claude"}
 
 

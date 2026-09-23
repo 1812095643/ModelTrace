@@ -6,6 +6,7 @@
   <title>ModelTrace</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='repository-link.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='workspace.css') }}">
 </head>
 <body>
   <header class="topbar">
@@ -28,38 +29,66 @@
 
     <main class="main-content">
       <section id="workspace-test" class="workspace active">
-        <div class="page-header"><h1>模型测试</h1><div id="active-bank-badge" class="privacy-badge">{{ unified.model_count }} 个候选模型</div></div>
+        <div class="page-header"><div><h1>模型检测工作台</h1><p>选择模型，观察真实回复，比较数字指纹。</p></div><div id="active-bank-badge" class="privacy-badge">{{ unified.model_count }} 个候选模型</div></div>
 
         <div class="mode-tabs" role="tablist" aria-label="测试方式">
-          <button class="mode-tab active" data-test-mode="manual" type="button">手动测试</button>
-          <button class="mode-tab" data-test-mode="api" type="button">API 自动测试</button>
+          <button class="mode-tab active" data-test-mode="api" type="button" role="tab" aria-selected="true" aria-controls="test-api">自动测试</button>
+          <button class="mode-tab" data-test-mode="manual" type="button" role="tab" aria-selected="false" aria-controls="test-manual">粘贴回答测试</button>
         </div>
 
-        <section id="test-manual" class="mode-panel active">
+        <section id="test-manual" class="mode-panel" role="tabpanel">
           <div class="panel-toolbar"><strong>三次挑战</strong><button id="regenerate" class="button secondary" type="button">重新生成</button></div>
           <div id="challenge-list" class="challenge-list" aria-live="polite"></div>
           <div class="action-row"><button id="analyze" class="button primary" type="button">计算归因概率</button></div>
+          <div id="test-message" class="message" hidden></div>
+          <section id="result" class="result-panel" hidden aria-live="polite"></section>
         </section>
 
-        <section id="test-api" class="mode-panel">
-          <form id="api-test-form" class="form-panel">
-            <div class="form-grid two">
-              <label><span>Base URL</span><input id="test-api-base" required placeholder="https://example.com/v1"></label>
-              <label><span>接口模型名</span><input id="test-api-model" required placeholder="模型名"></label>
-              <label><span>API Key</span><input id="test-api-key" type="password" required autocomplete="off"></label>
-              <label><span>温度（可选）</span><input id="test-temperature" type="number" min="0" max="2" step="0.1" placeholder="接口默认"></label>
-            </div>
-            <div class="form-footer"><button class="button primary" type="submit">开始测试</button></div>
+        <section id="test-api" class="mode-panel active" role="tabpanel">
+          <form id="auto-connect-form" class="connection-panel">
+            <div class="section-heading"><span class="step-number">01</span><div><h2>连接测试接口</h2><p>填写服务商的 URL 和 Key，读取可调用的 GPT / Claude 文字模型。</p></div></div>
+            <fieldset id="auto-connection-fields">
+              <div class="connection-fields">
+                <label for="auto-base-url">Base URL<input id="auto-base-url" type="url" required placeholder="https://your-provider.com/v1" autocomplete="off" spellcheck="false"><small>支持服务根地址、带前缀的 Base URL 或完整接口地址。</small></label>
+                <label for="auto-api-key">API Key<input id="auto-api-key" type="password" required placeholder="填写你的 API Key" autocomplete="off" spellcheck="false"><small>仅用于当前页面请求，不保存 Key。</small></label>
+                <button id="auto-load-models" class="button primary" type="submit">读取模型列表 <span aria-hidden="true">↗</span></button>
+              </div>
+              <details class="request-options"><summary>请求设置</summary><div class="options-fields">
+                <label for="auto-protocol">请求格式<select id="auto-protocol"><option value="auto">自动选择</option><option value="openai">OpenAI · Chat Completions</option><option value="responses">OpenAI · Responses</option><option value="anthropic">Claude 原生 · Messages</option></select></label>
+                <label for="auto-temperature">温度（可选）<input id="auto-temperature" type="number" min="0" max="2" step="0.1" placeholder="接口默认"></label>
+              </div></details>
+            </fieldset>
+            <p id="auto-connection-message" class="inline-message" role="status">尚未连接。也可以直接手动添加模型名。</p>
           </form>
-          <section id="api-test-progress" class="progress-panel" hidden aria-live="polite">
-            <div class="progress-heading"><strong id="api-progress-status">准备测试</strong><span id="api-progress-count">有效 0/3 · 已尝试 0/6</span></div>
-            <div class="progress-track"><i id="api-progress-fill"></i></div>
-            <div id="api-progress-steps" class="progress-steps"></div>
-          </section>
+
+          <div class="auto-workbench">
+            <section class="model-picker" aria-labelledby="model-picker-title">
+              <div class="section-heading"><span class="step-number">02</span><div><h2 id="model-picker-title">选择待测模型</h2><p>勾选后批量测试，也可逐个开始。</p></div></div>
+              <form id="auto-add-form" class="manual-model-form">
+                <label class="sr-only" for="auto-manual-model">手动输入模型名</label>
+                <input id="auto-manual-model" required maxlength="256" placeholder="手动输入模型名或别名" spellcheck="false" autocomplete="off">
+                <button id="auto-add-model" class="button secondary" type="submit">添加</button>
+              </form>
+              <p id="auto-add-message" class="inline-message" role="status" hidden></p>
+              <div class="selection-toolbar"><label for="auto-select-all"><input id="auto-select-all" type="checkbox">全选</label><button id="auto-clear-selection" class="text-button" type="button">取消全选</button><span id="auto-selection-count">已选 0 / 0</span></div>
+              <div id="auto-model-list" class="model-list"><div class="empty-models"><span aria-hidden="true">＋</span><strong>添加第一个待测模型</strong><p>读取接口列表，或在上方输入模型名。<br>列表中可以逐项勾选、全选和取消全选。</p></div></div>
+              <div class="batch-actions"><button id="auto-run-selected" class="button primary" type="button" disabled>批量测试（0）</button><button id="auto-stop" class="button secondary" type="button" hidden>停止后续测试</button><p>按顺序测试，每个模型目标为 3 份有效回复。</p></div>
+            </section>
+
+            <section class="live-workspace" aria-labelledby="auto-detail-title">
+              <div class="live-heading"><div class="section-heading"><span class="step-number">03</span><div><h2 id="auto-detail-title">测试全过程</h2><p id="auto-detail-subtitle">提示词、AI 回复和归因结果都在这里。</p></div></div><span id="auto-run-state" class="run-state" role="status" aria-live="polite">等待开始</span></div>
+              <div id="auto-batch-progress" class="batch-progress" hidden><div><span id="auto-batch-label" role="status"></span><button id="auto-follow" type="button" class="text-button" hidden>查看正在测试的模型</button></div><progress id="auto-batch-meter" value="0" max="1" aria-label="批量测试进度"></progress></div>
+              <p id="auto-run-message" class="inline-message" role="status" hidden></p>
+              <div id="auto-run-detail"><div class="empty-process"><div class="process-glyph" aria-hidden="true"><i></i><i></i><i></i></div><h3>每一次回复，都看得见。</h3><p>开始后，AI 生成的内容会实时填入回复框。<br>测试结束后可随时回看每个模型的完整过程。</p><div class="process-outline"><span>发送挑战</span><b>→</b><span>接收回复</span><b>→</b><span>比较指纹</span></div></div></div>
+            </section>
+          </div>
         </section>
 
-        <div id="test-message" class="message" hidden></div>
-        <section id="result" class="result-panel" hidden aria-live="polite"></section>
+        <details class="reference-catalog" open>
+          <summary>指纹库支持的模型 <span id="reference-count">{{ unified.model_count }} 个候选模型</span></summary>
+          <p>接口可调用的模型与已收录指纹分别列出。未收录模型仍可测试，结果只表示与现有候选的接近程度，不能据此确认真实身份。</p>
+          <div id="reference-model-list" class="reference-families" aria-live="polite"></div>
+        </details>
       </section>
 
       <section id="workspace-library" class="workspace">
@@ -90,6 +119,7 @@
             <label><span>指纹名称</span><input id="auto-model" list="model-options" required placeholder="例如 model-version-name"></label>
             <label><span>采集回答数</span><input id="sample-count" type="number" min="3" max="36" value="36" required></label>
             <label><span>温度（可选）</span><input id="temperature" type="number" min="0" max="2" step="0.1" placeholder="接口默认"></label>
+            <label><span>请求格式</span><select id="enroll-protocol"><option value="auto">自动选择</option><option value="openai">OpenAI · Chat Completions</option><option value="responses">OpenAI · Responses</option><option value="anthropic">Claude 原生 · Messages</option></select></label>
           </div>
           <div class="form-footer"><button class="button primary" type="submit">自动采集并建立指纹</button></div>
         </form>
@@ -102,5 +132,6 @@
   <datalist id="model-options">{% for model in bank.models %}<option value="{{ model.id }}">{% endfor %}</datalist>
   <script>window.BANK_SUMMARIES = {{ banks | tojson }}; window.UNIFIED_SUMMARY = {{ unified | tojson }}; window.DEFAULT_BANK_ID = {{ default_bank_id | tojson }};</script>
   <script src="{{ url_for('static', filename='app.js') }}"></script>
+  <script type="module" src="{{ url_for('static', filename='auto-test.js') }}"></script>
 </body>
 </html>

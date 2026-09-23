@@ -4,19 +4,20 @@ import json
 import math
 import re
 import secrets
-from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 
 from enrollment import bank_summary, enroll_automatic, request_completion, test_automatic
 from fingerprint import analyze_global_outputs, generate_challenges, load_bank, parse_numbers
 from bank_builder import build_bank, read_rows
+from model_testing import UpstreamError, connection_settings, list_models, probe_settings, stream_probe
+from runtime_paths import DATA_DIR
+from api_protocols import API_PATHS
 
 
 app = Flask(__name__)
-PROJECT = Path(__file__).resolve().parent
-CUSTOM_BANKS_FILE = PROJECT / "data" / "custom_banks.json"
-UNIFIED_BANK_FILE = PROJECT / "data" / "unified_bank.json"
+CUSTOM_BANKS_FILE = DATA_DIR / "custom_banks.json"
+UNIFIED_BANK_FILE = DATA_DIR / "unified_bank.json"
 DEFAULT_BANK_ID = "claude"
 
 
@@ -24,13 +25,13 @@ def builtin_configs() -> dict[str, dict]:
     return {
         "gpt": {
             "label": "GPT",
-            "bank_file": PROJECT / "data" / "gpt_bank.json",
-            "data_file": PROJECT / "data" / "gpt_reference.jsonl",
+            "bank_file": DATA_DIR / "gpt_bank.json",
+            "data_file": DATA_DIR / "gpt_reference.jsonl",
         },
         "claude": {
             "label": "Claude",
-            "bank_file": PROJECT / "data" / "claude_bank.json",
-            "data_file": PROJECT / "data" / "claude_reference.jsonl",
+            "bank_file": DATA_DIR / "claude_bank.json",
+            "data_file": DATA_DIR / "claude_reference.jsonl",
         },
     }
 
@@ -42,8 +43,8 @@ def load_configs() -> dict[str, dict]:
             bank_id = item["id"]
             configs[bank_id] = {
                 "label": item["label"],
-                "bank_file": PROJECT / "data" / f"{bank_id}_bank.json",
-                "data_file": PROJECT / "data" / f"{bank_id}_reference.jsonl",
+                "bank_file": DATA_DIR / f"{bank_id}_bank.json",
+                "data_file": DATA_DIR / f"{bank_id}_reference.jsonl",
                 "custom": True,
             }
     return configs
@@ -121,6 +122,13 @@ def requested_temperature(payload: dict) -> float | None:
     return None if value in (None, "") else float(value)
 
 
+def requested_api_format(payload: dict) -> str:
+    value = payload.get("api_format") or "auto"
+    if value not in {"auto", *API_PATHS}:
+        raise ValueError("请选择有效的请求格式。")
+    return value
+
+
 def summarized_bank(bank_id: str) -> dict:
     config = BANK_CONFIGS[bank_id]
     bank = banks.get(bank_id)
@@ -172,6 +180,44 @@ def challenges():
     return jsonify({"challenges": generate_challenges(3)})
 
 
+@app.get("/api/reference-models")
+def reference_models():
+    return jsonify({"models": [
+        {"id": model["id"], "family": model.get("family"),
+         "family_name": model.get("family_name"), "response_count": model["response_count"]}
+        for model in unified_bank["models"]
+    ]})
+
+
+@app.post("/api/models")
+def available_models():
+    try:
+        settings = connection_settings(request.get_json(silent=True))
+        return jsonify(list_models(**settings))
+    except UpstreamError as error:
+        return jsonify({"error": str(error), "upstream_status": error.status}), 502
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+
+
+@app.post("/api/test/stream")
+def stream_test():
+    try:
+        settings = probe_settings(request.get_json(silent=True))
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+
+    @stream_with_context
+    def events():
+        for event in stream_probe(**settings):
+            yield json.dumps(event, ensure_ascii=False) + "\n"
+
+    return Response(events(), mimetype="application/x-ndjson", headers={
+        "Cache-Control": "no-store", "X-Accel-Buffering": "no",
+        "X-Content-Type-Options": "nosniff",
+    })
+
+
 @app.post("/api/analyze")
 def analyze():
     try:
@@ -193,7 +239,7 @@ def automatic_test():
             api_model=payload["api_model"].strip(),
             temperature=requested_temperature(payload),
             bank=unified_bank,
-            api_format="auto",
+            api_format=requested_api_format(payload),
         )
         result["bank"] = summarized_unified_bank()
         return jsonify(result)
@@ -211,7 +257,7 @@ def automatic_test_probe():
             api_model=payload["api_model"].strip(),
             prompt=payload["prompt"],
             temperature=requested_temperature(payload),
-            api_format="auto",
+            api_format=requested_api_format(payload),
         )
         expected_count = int(payload["expected_count"])
         parsed_numbers = len(parse_numbers(text))
@@ -252,8 +298,8 @@ def create_bank():
         return jsonify({"error": "同名指纹库已存在"}), 400
     config = {
         "label": label,
-        "bank_file": PROJECT / "data" / f"{bank_id}_bank.json",
-        "data_file": PROJECT / "data" / f"{bank_id}_reference.jsonl",
+        "bank_file": DATA_DIR / f"{bank_id}_bank.json",
+        "data_file": DATA_DIR / f"{bank_id}_reference.jsonl",
         "custom": True,
     }
     config["data_file"].parent.mkdir(parents=True, exist_ok=True)
@@ -283,7 +329,7 @@ def automatic_enrollment():
             model_label=payload["model_label"].strip(),
             sample_count=int(payload.get("sample_count", 36)),
             temperature=requested_temperature(payload),
-            api_format="auto",
+            api_format=requested_api_format(payload),
             data_file=config["data_file"],
             bank_file=config["bank_file"],
             bank_id=bank_id,

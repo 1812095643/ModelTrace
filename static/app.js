@@ -34,7 +34,12 @@ function activateWorkspace(name) {
 }
 
 function activateMode(group, name) {
-  document.querySelectorAll(`[data-${group}-mode]`).forEach((item) => item.classList.toggle("active", item.dataset[`${group}Mode`] === name));
+  document.querySelectorAll(`[data-${group}-mode]`).forEach((item) => {
+    const selected = item.dataset[`${group}Mode`] === name;
+    item.classList.toggle("active", selected);
+    item.setAttribute("aria-selected", String(selected));
+    item.tabIndex = selected ? 0 : -1;
+  });
   document.querySelectorAll(`#workspace-${group === "test" ? "test" : "library"} .mode-panel`).forEach((item) => {
     item.classList.toggle("active", item.id === `${group}-${name}` || item.id === `library-${name}`);
   });
@@ -126,105 +131,11 @@ async function analyzeManual() {
   button.disabled = false;
 }
 
-function renderApiProgress(states, status) {
-  const valid = states.filter((state) => state === "done").length;
-  const attempted = states.filter((state) => ["done", "invalid", "error"].includes(state)).length;
-  const target = 3;
-  byId("api-test-progress").hidden = false;
-  byId("api-progress-status").textContent = status;
-  byId("api-progress-count").textContent = `有效 ${valid}/${target} · 已尝试 ${attempted}/${states.length}`;
-  byId("api-progress-fill").style.width = `${(valid / target) * 100}%`;
-  byId("api-progress-steps").innerHTML = states.map((state, index) => {
-    const labels = { pending: "等待", working: "请求中", done: "有效", invalid: "数字不足", error: "接口失败", skipped: "无需调用" };
-    return `<span class="progress-step ${state}"><b>${index + 1}</b>挑战 ${index + 1} · ${labels[state]}</span>`;
-  }).join("");
-}
-
-async function testViaApi(event) {
-  event.preventDefault();
-  const button = event.currentTarget.querySelector("button[type=submit]");
-  button.disabled = true;
-  byId("result").hidden = true;
-  setMessage(byId("test-message"), "");
-
-  const challengeResponse = await fetch("/api/challenges");
-  const firstBatch = (await challengeResponse.json()).challenges;
-  const retryResponse = await fetch("/api/challenges");
-  const challenges = firstBatch.concat((await retryResponse.json()).challenges);
-  const states = challenges.map(() => "pending");
-  const outputs = [];
-  const errors = [];
-  const target = 3;
-  const configuration = {
-    base_url: byId("test-api-base").value,
-    api_key: byId("test-api-key").value,
-    api_model: byId("test-api-model").value,
-    temperature: optionalNumber("test-temperature"),
-  };
-  renderApiProgress(states, "已生成独立挑战，准备调用模型");
-
-  for (let index = 0; index < challenges.length && outputs.length < target; index += 1) {
-    states[index] = "working";
-    renderApiProgress(states, `正在进行第 ${index + 1} 次尝试，等待模型完整输出……`);
-    try {
-      const response = await fetch("/api/test/probe", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          ...configuration,
-          prompt: challenges[index].prompt,
-          expected_count: challenges[index].expected_count,
-        }),
-      });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "接口请求失败");
-      if (payload.accepted) {
-        outputs.push({ text: payload.text, expected_count: challenges[index].expected_count });
-        states[index] = "done";
-      } else {
-        errors.push(`尝试 ${index + 1}: 有效数字 ${payload.parsed_numbers}/${payload.minimum_numbers}`);
-        states[index] = "invalid";
-      }
-    } catch (error) {
-      errors.push(`尝试 ${index + 1}: ${error.message}`);
-      states[index] = "error";
-    }
-    renderApiProgress(states, `当前已有 ${outputs.length}/${target} 份有效回答`);
-  }
-
-  if (outputs.length === target) {
-    states.forEach((state, index) => { if (state === "pending") states[index] = "skipped"; });
-  }
-
-  if (!outputs.length) {
-    renderApiProgress(states, "六次尝试后仍没有可用回答");
-    setMessage(byId("test-message"), `没有获得可分析输出。${errors[0] || ""}`, "error");
-    button.disabled = false;
-    return;
-  }
-
-  renderApiProgress(states, "模型回答已收齐，正在计算归因概率……");
-  const analysisResponse = await fetch("/api/analyze", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ outputs }),
-  });
-  const result = await analysisResponse.json();
-  if (analysisResponse.ok) {
-    const attempted = states.filter((state) => ["done", "invalid", "error"].includes(state)).length;
-    result.api_test = { requested: target, attempted, max_attempts: challenges.length, received: outputs.length, errors };
-    renderApiProgress(states, `测试完成：${outputs.length}/${target} 份有效回答进入归因`);
-    renderResult(result);
-  } else {
-    setMessage(byId("test-message"), result.error || "API 自动测试失败。", "error");
-  }
-  button.disabled = false;
-}
-
 function updateUnifiedSummary(summary) {
   state.unified = summary;
   byId("topbar-bank-count").textContent = `${summary.model_count} 个候选模型`;
   byId("active-bank-badge").textContent = `${summary.model_count} 个候选模型`;
+  window.dispatchEvent(new Event("reference-bank-updated"));
 }
 
 function renderInventory() {
@@ -271,6 +182,7 @@ async function enrollAutomatically(event) {
         model_label: byId("auto-model").value,
         sample_count: requested,
         temperature: optionalNumber("temperature"),
+        api_format: byId("enroll-protocol").value,
       }),
     });
   } catch (error) {
@@ -326,13 +238,21 @@ async function createBank(event) {
 
 document.querySelectorAll("[data-workspace]").forEach((button) => button.addEventListener("click", () => activateWorkspace(button.dataset.workspace)));
 document.querySelectorAll("[data-test-mode]").forEach((button) => button.addEventListener("click", () => activateMode("test", button.dataset.testMode)));
+document.querySelectorAll("[data-test-mode]").forEach((button) => button.addEventListener("keydown", (event) => {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  event.preventDefault();
+  const tabs = [...document.querySelectorAll("[data-test-mode]")];
+  const index = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (tabs.indexOf(button) + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+  tabs[index].click();
+  tabs[index].focus();
+}));
 byId("bank-select").addEventListener("change", (event) => selectBank(event.target.value));
 byId("regenerate").addEventListener("click", loadChallenges);
 byId("analyze").addEventListener("click", analyzeManual);
-byId("api-test-form").addEventListener("submit", testViaApi);
 byId("auto-enrollment").addEventListener("submit", enrollAutomatically);
 byId("show-create-bank").addEventListener("click", () => { byId("create-bank-form").hidden = !byId("create-bank-form").hidden; });
 byId("create-bank-form").addEventListener("submit", createBank);
 
 renderInventory();
+activateMode("test", "api");
 loadChallenges();

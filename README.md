@@ -11,6 +11,21 @@ python start.py
 
 页面地址为 `http://127.0.0.1:7860/`。
 
+## Windows EXE
+
+双击 `ModelTrace.exe` 即可启动，已包含 Python、依赖库、页面及初始指纹数据，无需安装 Python。程序自动选择可用端口并打开系统默认浏览器；使用期间保留启动窗口，关闭窗口或按 `Ctrl+C` 即可停止。
+
+EXE 版的指纹数据保存在 `%LOCALAPPDATA%\ModelTrace\data`，新建指纹库和采集结果不会随程序退出丢失。API Key 仍只在当前页面使用，不保存。系统需要有可用的浏览器。
+
+需要重新打包时，在项目目录执行：
+
+```powershell
+python -m pip install pyinstaller
+python -m PyInstaller --noconfirm ModelTrace.spec
+```
+
+生成文件为 `dist/ModelTrace.exe`。可使用 `--no-browser` 禁止自动打开页面，或使用 `--port 7861` 指定端口；默认自动分配端口避免冲突。
+
 ## GitHub Pages
 
 `static/index.html` 是不依赖后端的手动测试版本，归因计算和指纹库读取都在浏览器本地完成。仓库附带的 GitHub Actions 会将 `static/` 部署到 GitHub Pages。
@@ -18,10 +33,18 @@ python start.py
 ## 使用
 
 - **手动测试**：复制三条挑战，分别发送给同一个待测模型，再粘贴每次完整输出。
-- **API 自动测试**：填写 Base URL、API Key 和模型名。程序会自动尝试 OpenAI Chat Completions 与 Anthropic Messages 格式，以三份有效回答为目标完成归因。
+- **读取模型列表**：填写 Base URL 和 API Key，点击“读取模型列表”。服务通过普通 HTTP 请求访问 `/models`，支持 GPT 兼容接口和 Claude 原生接口的分页列表，只展示 GPT / Claude 文字模型。
+- **选择模型**：列表支持逐项勾选、全选和取消全选。也可以手动添加模型名或服务商别名，不要求 `/models` 接口可用；重复名称只会重新勾选，不会生成重复任务。
+- **单个与批量测试**：点击模型行的“测试”，或点击“批量测试”顺序测试已勾选模型。每个模型首轮同时发起三条挑战；有效回复不足三条时并发补测缺少数量，总请求数最多六次。并发状态和每条回复实时可见。
+- **查看全过程**：每个挑战显示提示词、请求格式、请求地址、状态记录及完整回复，流式文字自动填入回复框。接口返回普通 JSON 时整段显示真实回复。截断、中断和接口异常会保留已收到的内容，但不计入有效回答。
+- **停止与回看**：可停止后续排队，已经发出的请求是否继续处理由上游服务决定。点击模型行的“过程”回看各自回复与结果；切换连接信息后清除旧接口列表及结果，防止混用不同服务的证据。
+- **支持识别的模型**：测试页直接列出全部已收录指纹，模型列表注明“指纹已收录 / 指纹未收录”。未收录模型仍可测试，结果只表示与候选模型的接近程度，不代表身份确认。
 - **指纹库管理**：可以新建指纹库，或通过 API 为现有指纹库添加模型指纹。
+- **OpenAI Responses**：在“请求设置 → 请求格式”中选择“OpenAI · Responses”，使用 `/responses` 完成单个及批量测试；指纹采集表单也支持选择此格式。可以填写带前缀的 Base URL 或完整 `/v1/responses` 地址，读取模型列表后会保留识别到的格式。自动模式在当前协议明确不被支持时，也会尝试 Responses。
+- **Responses 回复处理**：实时接收正文增量；完成事件中的全文用于校正回复框，不重复追加。未完成、拒绝或中途异常的回复保留已收到内容，但不计入归因；推理摘要和工具参数不作为数字指纹。每次挑战独立发送，不保留上游响应状态。
 
 API Key 只用于当前页面发起请求，不写入磁盘。
+自动测试使用本地 Python 服务发起 HTTP 请求，避免浏览器跨域限制；新增功能需要运行本地版，GitHub Pages 仍是手动粘贴版本。请求设置可指定 OpenAI Chat Completions、OpenAI Responses 或 Claude 原生格式，留空温度使用服务商默认值。自动格式仅在当前协议被明确拒绝时尝试另一种协议；鉴权和限流问题不会盲目切换协议。
 自动采集会在对应的 `*_reference.jsonl` 中保存实际 user prompt、base prompt、system prompt 和 user prefix；拟合后的 `*_bank.json` 与 `unified_bank.json` 只保存统计指纹和校准参数。
 
 ## 指纹方法
@@ -60,6 +83,8 @@ fingerprint.py      指纹提取与归因
 bank_builder.py     指纹库构建与概率校准
 challenge_suite.py  自动建库挑战
 enrollment.py       API 调用与指纹采集
+model_testing.py    模型列表、普通 HTTP 请求与流式测试
+api_protocols.py    请求格式、地址归一和 Responses 正文提取
 rebuild_unified_bank.py  重建统一全局库
 data/               参考数据与指纹库
 static/             页面资源

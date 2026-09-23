@@ -16,11 +16,15 @@ from pathlib import Path
 from fingerprint import analyze_global_outputs, generate_challenges, parse_numbers
 from bank_builder import build_bank, read_rows
 from challenge_suite import fingerprint_suite
+from runtime_paths import DATA_DIR
+from api_protocols import (
+    API_PATHS, PROTOCOL_REJECTION_STATUS, normalize_base_url, protocol_order,
+    response_content, response_problem, responses_body,
+)
 
 
-PROJECT = Path(__file__).resolve().parent
-DATA_FILE = PROJECT / "data" / "gpt_reference.jsonl"
-BANK_FILE = PROJECT / "data" / "gpt_bank.json"
+DATA_FILE = DATA_DIR / "gpt_reference.jsonl"
+BANK_FILE = DATA_DIR / "gpt_bank.json"
 
 # urllib 默认的 Python-urllib User-Agent 会被 Cloudflare/WAF 网关直接拦成 403，
 # 因此伪装成真实客户端（与 gpt56 检测器使用的 UA 一致）。
@@ -155,18 +159,9 @@ def enroll_manual(
 
 
 def completion_url(base_url: str, api_format: str = "openai") -> str:
-    normalized = base_url.rstrip("/")
-    if api_format == "anthropic":
-        if normalized.endswith("/messages"):
-            return normalized
-        if normalized.endswith("/v1"):
-            return normalized + "/messages"
-        return normalized + "/v1/messages"
-    if normalized.endswith("/chat/completions"):
-        return normalized
-    if normalized.endswith("/v1"):
-        return normalized + "/chat/completions"
-    return normalized + "/v1/chat/completions"
+    if api_format not in API_PATHS:
+        raise ValueError("请选择有效的请求格式。")
+    return normalize_base_url(base_url) + API_PATHS[api_format]
 
 
 def _looks_like_waf_block(text: str) -> bool:
@@ -242,6 +237,8 @@ def _request_completion(
             "Accept": "application/json",
             "User-Agent": upstream_user_agent(),
         }
+    if api_format == "responses":
+        body_data = responses_body(api_model, prompt, temperature, system_prompt)
     if temperature is not None:
         body_data["temperature"] = temperature
     body = json.dumps(body_data).encode("utf-8")
@@ -268,7 +265,12 @@ def _request_completion(
                 continue
             retried = f"（已自动重试 {attempt - 1} 次）" if attempt > 1 else ""
             raise RuntimeError(f"无法连接接口：{reason}{retried}") from error
-    if api_format == "anthropic":
+    if api_format == "responses":
+        issue = response_problem(payload)
+        if issue:
+            raise RuntimeError(issue.replace(api_key, "[已隐藏 Key]"))
+        content = response_content(payload)
+    elif api_format == "anthropic":
         content = "".join(
             block.get("text", "")
             for block in payload["content"]
@@ -302,7 +304,7 @@ def request_completion(
         return _request_completion(
             base_url, api_key, api_model, prompt, temperature, api_format, system_prompt
         )
-    formats = ("openai", "anthropic")
+    formats = protocol_order(api_format, api_model, base_url)
     errors = []
     for candidate in formats:
         try:
@@ -310,6 +312,8 @@ def request_completion(
                 base_url, api_key, api_model, prompt, temperature, candidate, system_prompt
             )
         except RuntimeError as error:
+            if getattr(error.__cause__, "code", None) not in PROTOCOL_REJECTION_STATUS:
+                raise
             errors.append(f"{candidate}: {error}")
     raise RuntimeError("接口格式自动探测失败；" + "；".join(errors))
 
